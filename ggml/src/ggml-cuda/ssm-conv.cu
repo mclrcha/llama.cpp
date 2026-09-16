@@ -204,3 +204,129 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+#if defined(GGML_USE_HIP)
+struct conv_qk_args { float *q,*k;int heads;float eps,scale,bias; };
+template<bool indexed,bool normalize>
+static __global__ void conv_prepare_silu_f32(const float * old_state,const float * input,
+        const float * weight,float * next_state,float * output,const int32_t * index,int64_t stride,conv_qk_args qk) {
+    if constexpr(indexed) { old_state+=int64_t(*index)*stride; }
+    const int tid=threadIdx.x,c=blockIdx.x*128+tid;
+    float value=0.0f;
+    if(tid<128) {
+    const float x0=old_state[3*c],x1=old_state[3*c+1],x2=old_state[3*c+2],x3=input[c];
+    float sum=0.0f;
+    sum=fmaf(x0,weight[4*c],sum);
+    sum=fmaf(x1,weight[4*c+1],sum);
+    sum=fmaf(x2,weight[4*c+2],sum);
+    sum=fmaf(x3,weight[4*c+3],sum);
+    sum+=0.0f;
+    next_state[3*c]=x1;next_state[3*c+1]=x2;next_state[3*c+2]=x3;
+    value=ggml_cuda_op_silu_single(sum);
+    output[c]=value;
+    }
+    if constexpr(normalize) {
+        if(blockIdx.x<2*qk.heads) {
+            float squared=0.0f;
+            if(tid<128) { squared+=value*value; }
+            extern __shared__ float partial[];
+            squared=block_reduce<block_reduce_method::SUM,256>(squared,partial);
+            const float scale=rsqrtf(squared/128+qk.eps);
+            if(tid<128) {
+                float *dst=blockIdx.x<qk.heads ? qk.q : qk.k;
+                const int row=blockIdx.x<qk.heads ? blockIdx.x : blockIdx.x-qk.heads;
+                const float normalized=scale*value;
+                dst[row*128+tid]=qk.scale*normalized+qk.bias;
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_conv_prepare(ggml_backend_cuda_context & ctx,const ggml_tensor * concat,
+        const ggml_tensor * weight,const ggml_tensor * state,ggml_tensor * output,const ggml_tensor * gathered,
+        const ggml_tensor *norm,ggml_tensor *q,ggml_tensor *k) {
+    conv_qk_args qk{};
+    if(norm) { qk={static_cast<float *>(q->data),static_cast<float *>(k->data),int(norm->ne[1]),
+        ggml_get_op_params_f32(norm,0),ggml_get_op_params_f32(q,0),ggml_get_op_params_f32(q,1)}; }
+    const ggml_cuda_kernel_launch_params params(dim3(concat->ne[1]/128),dim3(norm ? 256 : 128),norm ? 32*sizeof(float) : 0,ctx.stream());
+    const auto launch=[&](auto flag,auto normalize) {
+        ggml_cuda_kernel_launch(conv_prepare_silu_f32<decltype(flag)::value,decltype(normalize)::value>,params,
+            static_cast<const float *>(gathered ? gathered->src[0]->data : concat->src[0]->data),
+            static_cast<const float *>(concat->src[1]->data),static_cast<const float *>(weight->data),
+            static_cast<float *>(state->data),static_cast<float *>(output->data),
+            gathered ? static_cast<const int32_t *>(gathered->src[1]->data) : nullptr,
+            gathered ? int64_t(gathered->src[0]->nb[1]/sizeof(float)) : 0,qk);
+    };
+    if(norm) {
+        if(gathered) { launch(std::true_type{},std::true_type{}); } else { launch(std::false_type{},std::true_type{}); }
+    } else {
+        if(gathered) { launch(std::true_type{},std::false_type{}); } else { launch(std::false_type{},std::false_type{}); }
+    }
+}
+#endif
+
+#if defined(GGML_USE_HIP)
+static __global__ void conv_prefill_halo(const float * old, const float * input, float * halo, int h) {
+    const int c=blockIdx.x*128+threadIdx.x;
+    const int begin=blockIdx.y*32;
+    if(c>=h) { return; }
+#pragma unroll
+    for(int j=0;j<3;++j) {
+        halo[(size_t(blockIdx.y)*3+j)*h+c]=begin==0 ? old[3*c+j] : input[size_t(begin+j-3)*h+c];
+    }
+}
+template <bool halo_input = false>
+static __global__ void conv_prefill_direct(const float * old,const float * input,const float * weights,
+        float * state,float * output,int h,int n) {
+    const int c=blockIdx.x*128+threadIdx.x;
+    const int begin=blockIdx.y*32;
+    if (c>=h) { return; }
+    float w[4],x[4];
+#pragma unroll
+    for(int j=0;j<4;++j) { w[j]=weights[4*c+j]; }
+#pragma unroll
+    for(int j=0;j<3;++j) {
+        x[j]=halo_input ? old[(size_t(blockIdx.y)*3+j)*h+c] : (begin+j<3 ? old[3*c+begin+j] : input[(size_t)(begin+j-3)*h+c]);
+    }
+    const int end=min(begin+32,n);
+    for(int t=begin;t<end;++t) {
+        x[3]=input[(size_t)t*h+c];
+        float sum=0.0f;
+#pragma unroll
+        for(int j=0;j<4;++j) { sum+=x[j]*w[j]; }
+        sum+=0.0f;
+        output[(size_t)t*h+c]=ggml_cuda_op_silu_single(sum);
+#pragma unroll
+        for(int j=0;j<3;++j) { x[j]=x[j+1]; }
+    }
+    if(end==n) {
+#pragma unroll
+        for(int j=0;j<3;++j) { state[3*c+j]=x[j]; }
+    }
+}
+void ggml_cuda_conv_prefill(ggml_backend_cuda_context & ctx,const ggml_tensor * cat,
+        const ggml_tensor * weight,const ggml_tensor * state,ggml_tensor * output,bool scratch) {
+    const int h=cat->ne[1],n=cat->src[1]->ne[0];
+    static const bool halo_enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_CONV_HALO"); return v && atoi(v)!=0; }();
+    const auto disjoint=[](const ggml_tensor * a,const ggml_tensor * b) {
+        const uintptr_t x=(uintptr_t)a->data,y=(uintptr_t)b->data;
+        return x+ggml_nbytes(a)<=y || y+ggml_nbytes(b)<=x;
+    };
+    if(halo_enabled && scratch && output->data==cat->src[1]->data &&
+            disjoint(output,cat->src[0]) && disjoint(output,weight)) {
+        const dim3 grid((h+127)/128,(n+31)/32);
+        conv_prefill_halo<<<grid,128,0,ctx.stream()>>>((const float *)cat->src[0]->data,
+            (const float *)cat->src[1]->data,(float *)cat->data,h);
+        CUDA_CHECK(cudaGetLastError());
+        conv_prefill_direct<true><<<grid,128,0,ctx.stream()>>>((const float *)cat->data,
+            (const float *)cat->src[1]->data,(const float *)weight->data,(float *)state->data,(float *)output->data,h,n);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    conv_prefill_direct<false><<<dim3((h+127)/128,(n+31)/32),128,0,ctx.stream()>>>(
+        (const float *)cat->src[0]->data,(const float *)cat->src[1]->data,(const float *)weight->data,
+        (float *)state->data,(float *)(scratch ? cat->data : output->data),h,n);
+    CUDA_CHECK(cudaGetLastError());
+    if(scratch) { CUDA_CHECK(cudaMemcpyAsync(output->data,cat->data,ggml_nbytes(output),cudaMemcpyDeviceToDevice,ctx.stream())); }
+}
+#endif

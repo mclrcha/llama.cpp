@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "unary.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -454,11 +455,11 @@ static __global__ void quantize_mmq_mxfp4(const float * __restrict__ x,
 }
 
 // scatter: grid over tokens, quantize once, write to all the token's compact rows
-template <mmq_q8_1_ds_layout ds_layout, bool scatter>
+template <mmq_q8_1_ds_layout ds_layout, bool scatter, bool silu = false>
 static __global__ void quantize_mmq_q8_1(
         const float * __restrict__ x, const int32_t * __restrict__ ids, void * __restrict__ vy,
         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
-        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used) {
+        const int64_t ne0, const int ne1, const int ne2, const int n_expert_used, const float * up = nullptr) {
 
     constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
     constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
@@ -489,7 +490,16 @@ static __global__ void quantize_mmq_q8_1(
     const int64_t iqs     = i0 % QK8_1_MMQ; // quant index in block
 
     // Load 4 floats per thread and calculate max. abs. value between them:
-    const float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 xi = i0 < ne00 ? x4[(base_idx + i00)/4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if constexpr (silu) {
+        if(i0<ne00) {
+            const float4 u=((const float4 *)up)[(base_idx+i00)/4];
+            xi.x=ggml_cuda_op_silu_single(xi.x)*u.x;
+            xi.y=ggml_cuda_op_silu_single(xi.y)*u.y;
+            xi.z=ggml_cuda_op_silu_single(xi.z)*u.z;
+            xi.w=ggml_cuda_op_silu_single(xi.w)*u.w;
+        }
+    }
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -695,3 +705,20 @@ void quantize_mmq_fp4_cuda(
         quantize_mmq_mxfp4<false><<<num_blocks, block_size, 0, stream>>>(x, ids, vy, ne00, s01, s02, s03, ne0, ne1, ne2, /*n_expert_used=*/0);
     }
 }
+
+#if defined(GGML_USE_HIP)
+void quantize_mmq_silu_cuda(const float * gate,const float * up,void * dst,ggml_type type,
+        int64_t k,int64_t n,cudaStream_t stream,const int32_t * ids) {
+    const dim3 grid(n,k/(4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ));
+    const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+    switch(mmq_get_q8_1_ds_layout(type)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D4,false,true><<<grid,block,0,stream>>>(gate,ids,dst,k,k,k*n,k*n,k,n,1,0,up);break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_DS4,false,true><<<grid,block,0,stream>>>(gate,ids,dst,k,k,k*n,k*n,k,n,1,0,up);break;
+        case MMQ_Q8_1_DS_LAYOUT_D2S6:
+            quantize_mmq_q8_1<MMQ_Q8_1_DS_LAYOUT_D2S6,false,true><<<grid,block,0,stream>>>(gate,ids,dst,k,k,k*n,k*n,k,n,1,0,up);break;
+        default: GGML_ABORT("unsupported MMQ layout");
+    }
+}
+#endif

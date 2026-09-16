@@ -1665,12 +1665,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        static const int batch_inputs_mode = [] {
+            const char * value = getenv("GGML_SCHED_BATCH_INPUTS");
+            return value ? atoi(value) : 0;
+        }();
+        const bool batch_host_inputs = batch_inputs_mode != 0 && split_backend->iface.set_tensor_async &&
+            strncmp(ggml_backend_name(split_backend), "ROCm", 4) == 0;
+        bool pending_host_inputs = false;
+
         // copy the input tensors to the split backend
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            const bool batch_computed_host = batch_inputs_mode >= 2 &&
+                ggml_backend_buffer_get_usage(input->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+            if (batch_host_inputs && ggml_backend_buffer_is_host(input->buffer) &&
+                    ((input->flags & GGML_TENSOR_FLAG_INPUT) || batch_computed_host)) {
+                if (!(input->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    ggml_backend_synchronize(input_backend);
+                }
+                if (!pending_host_inputs) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        if (batch_inputs_mode >= 3) {
+                            ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                        } else {
+                            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                        }
+                    } else if (batch_inputs_mode < 3) {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                }
+                GGML_ASSERT(ggml_are_same_layout(input, input_cpy));
+                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                pending_host_inputs = true;
+                continue;
+            }
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1790,6 +1821,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
             }
+        }
+
+        if (pending_host_inputs) {
+            // Finish every host read before the caller can overwrite or free its inputs.
+            ggml_backend_synchronize(split_backend);
         }
 
         if (!sched->callback_eval) {

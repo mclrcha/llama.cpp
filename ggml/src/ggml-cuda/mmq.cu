@@ -83,7 +83,7 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * silu_gate, const ggml_tensor * silu_up) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
@@ -153,8 +153,16 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, stream);
 
             } else {
+#if defined(GGML_USE_HIP)
+                if (silu_gate) {
+                    quantize_mmq_silu_cuda((const float *)silu_gate->data,(const float *)silu_up->data,
+                        src1_q8_1.get(),src0->type,ne10,ne11,stream);
+                } else
+#endif
+                {
                 quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
+                }
             }
             CUDA_CHECK(cudaGetLastError());
         }
@@ -232,6 +240,11 @@ void ggml_cuda_mul_mat_q(
         } else if (dedup_bcast) {
             quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
+#if defined(GGML_USE_HIP)
+        } else if (silu_gate) {
+            quantize_mmq_silu_cuda((const float *) silu_gate->data, (const float *) silu_up->data,
+                src1_q8_1.get(), src0->type, ne10, ne11_flat, stream, ids_src1.get());
+#endif
         } else {
             quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);

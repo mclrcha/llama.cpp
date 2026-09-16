@@ -139,6 +139,51 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+#if defined(GGML_USE_HIP)
+// Flatten short rows so lanes copy adjacent outputs, as in the Vulkan shader.
+template <typename T>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+concat_short_rows(const char * src0, const char * src1, T * dst,
+                  uint32_t n, uint32_t ne00, uint3 ne0_fd,
+                  size_t nb00, size_t nb01, size_t nb10, size_t nb11) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const uint32_t row = fastdiv(i, ne0_fd);
+    const uint32_t col = i - row * ne0_fd.z;
+    const char * src = col < ne00 ? src0 + row * nb01 + col * nb00
+                                 : src1 + row * nb11 + (col - ne00) * nb10;
+    dst[i] = *reinterpret_cast<const T *>(src);
+}
+#endif
+
+#if defined(GGML_USE_HIP)
+template<typename T>
+static __global__ void __launch_bounds__(256)
+concat_transposed_rows(const char * a, const char * b, T * dst, int tokens, int channels, int prefix,
+                       size_t a0, size_t a1, size_t b0, size_t b1) {
+    __shared__ T tile[32][33];
+    const int x=threadIdx.x, y=threadIdx.y;
+    const int token_tile=blockIdx.y;
+    const int channel_tile=blockIdx.x;
+#pragma unroll
+    for (int j=0;j<32;j+=8) {
+        const int t=token_tile*32+y+j, c=channel_tile*32+x;
+        if (t<tokens && c<channels) {
+            const char * src=t<prefix ? a+c*a1+t*a0 : b+c*b1+(t-prefix)*b0;
+            tile[y+j][x]=*reinterpret_cast<const T *>(src);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j=0;j<32;j+=8) {
+        const int t=token_tile*32+x, c=channel_tile*32+y+j;
+        if (t<tokens && c<channels) { dst[size_t(c)*tokens+t]=tile[x][y+j]; }
+    }
+}
+#endif
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -162,6 +207,39 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
+#if defined(GGML_USE_HIP)
+        static const bool flatten_short_rows = [] {
+            const char * value = std::getenv("GGML_HIP_CONCAT_FLAT");
+            return value && std::atoi(value) != 0;
+        }();
+        const int64_t n = ggml_nelements(dst);
+        static const int transpose_rows = []() {
+            const char * env = getenv("GGML_HIP_CONCAT_TRANSPOSE");
+            return env ? std::atoi(env) : 0;
+        }();
+        if (transpose_rows == 2 && src0->type == GGML_TYPE_F32 && dim == 0 &&
+                dst->ne[0] >= 128 && dst->ne[0] <= 32*65535 && dst->ne[1] == 8192 &&
+                dst->ne[2] == 1 && dst->ne[3] == 1 && ggml_is_contiguous(dst) &&
+                src0->ne[0] <= 16 && src1->nb[1] == sizeof(T) &&
+                GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            const dim3 grid((dst->ne[1]+31)/32,(dst->ne[0]+31)/32);
+            concat_transposed_rows<T><<<grid,dim3(32,8),0,stream>>>(
+                static_cast<const char *>(src0->data),static_cast<const char *>(src1->data),static_cast<T *>(dst->data),
+                int(dst->ne[0]),int(dst->ne[1]),int(src0->ne[0]),src0->nb[0],src0->nb[1],src1->nb[0],src1->nb[1]);
+            return;
+        }
+        if (flatten_short_rows && src0->type == GGML_TYPE_F32 && dim == 0 && dst->ne[0] <= 32 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+                n > 0 && n <= INT32_MAX && ggml_is_contiguous(dst) &&
+                GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            const ggml_cuda_kernel_launch_params params((n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE,
+                                                       CUDA_CONCAT_BLOCK_SIZE, 0, stream);
+            ggml_cuda_kernel_launch(concat_short_rows<T>, params,
+                static_cast<const char *>(src0->data), static_cast<const char *>(src1->data), static_cast<T *>(dst->data),
+                uint32_t(n), uint32_t(src0->ne[0]), init_fastdiv_values(dst->ne[0]),
+                src0->nb[0], src0->nb[1], src1->nb[0], src1->nb[1]);
+            return;
+        }
+#endif
 
         dim3 grid_dim(dst->ne[1], dst->ne[2], dst->ne[3]);
         auto launch_kernel = [&](auto dim) {

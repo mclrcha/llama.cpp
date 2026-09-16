@@ -615,3 +615,37 @@ void ggml_cuda_dup(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     ggml_cuda_cpy(ctx, src0, dst);
 }
+
+#if defined(GGML_USE_HIP)
+struct ggml_cuda_copy_batch_args {
+    const char * src[4];
+    uint32_t * dst[4];
+    size_t row_stride[4];
+};
+
+static __global__ void __launch_bounds__(256)
+cpy_f32_short_batch(ggml_cuda_copy_batch_args args, uint32_t n, uint3 width_fd) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const uint32_t row = fastdiv(i, width_fd);
+    const uint32_t col = i - row * width_fd.z;
+    const int slot = blockIdx.y;
+    args.dst[slot][i] = reinterpret_cast<const uint32_t *>(args.src[slot] + row * args.row_stride[slot])[col];
+}
+
+void ggml_cuda_cpy_f32_batch(ggml_backend_cuda_context & ctx, const ggml_tensor * const * sources,
+                            const ggml_tensor * const * destinations, int count) {
+    GGML_ASSERT(count >= 2 && count <= 4);
+    ggml_cuda_copy_batch_args args{};
+    for (int i = 0; i < count; ++i) {
+        args.src[i] = static_cast<const char *>(sources[i]->data);
+        args.dst[i] = static_cast<uint32_t *>(destinations[i]->data);
+        args.row_stride[i] = sources[i]->nb[1];
+    }
+    const uint32_t n = ggml_nelements(sources[0]);
+    const ggml_cuda_kernel_launch_params params(dim3((n + 255) / 256, count), 256, 0, ctx.stream());
+    ggml_cuda_kernel_launch(cpy_f32_short_batch, params, args, n, init_fastdiv_values(sources[0]->ne[0]));
+}
+#endif

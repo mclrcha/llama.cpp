@@ -56,6 +56,143 @@ static __device__ __forceinline__ uint32_t top_k_float_to_ordered(float value) {
     return bits ^ mask;
 }
 
+struct top_k_pair {
+    uint32_t index;
+    uint32_t key;
+};
+
+template<bool first, bool last>
+static __global__ void top_k_tournament(
+        const float * src, const top_k_pair * input, top_k_pair * output, int * dst,
+        int ncols, int output_cols, int k) {
+    constexpr int BLOCK = 256;
+    constexpr int WAVE = 32;
+    const int tid = threadIdx.x;
+    const int lane = tid % WAVE;
+    const int warp = tid / WAVE;
+    const int col = blockIdx.x * BLOCK + tid;
+    const int row = blockIdx.y;
+    const bool valid = col < ncols;
+    const int limit = min(k, ncols - int(blockIdx.x) * BLOCK);
+    top_k_pair value = {};
+    if (valid) {
+        if constexpr (first) {
+            value = {uint32_t(col), top_k_float_to_ordered(src[size_t(row) * ncols + col])};
+        } else {
+            value = input[size_t(row) * ncols + col];
+        }
+    }
+    __shared__ int histogram[256];
+    __shared__ int wave_counts[BLOCK / WAVE];
+    __shared__ int equal_counts[BLOCK / WAVE];
+    __shared__ int next_bin, next_rank, complete;
+    uint32_t prefix = 0, mask = 0;
+    int rank = limit;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        histogram[tid] = 0;
+        __syncthreads();
+        if (valid && (value.key & mask) == prefix) {
+            atomicAdd(&histogram[(value.key >> shift) & 255], 1);
+        }
+        __syncthreads();
+        const int count = histogram[255 - tid];
+        int inclusive = count;
+#pragma unroll
+        for (int delta = 1; delta < WAVE; delta *= 2) {
+            const int previous = __shfl_up_sync(0xffffffff, inclusive, delta, WAVE);
+            if (lane >= delta) {
+                inclusive += previous;
+            }
+        }
+        if (lane == WAVE - 1) {
+            wave_counts[warp] = inclusive;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int w = 0; w < BLOCK / WAVE; ++w) {
+            if (w < warp) {
+                inclusive += wave_counts[w];
+            }
+        }
+        const int higher = inclusive - count;
+        if (higher < rank && inclusive >= rank) {
+            next_bin = 255 - tid;
+            next_rank = rank - higher;
+            complete = count == rank - higher;
+        }
+        __syncthreads();
+        prefix |= uint32_t(next_bin) << shift;
+        mask |= uint32_t(255) << shift;
+        rank = next_rank;
+        if (complete) {
+            break;
+        }
+    }
+
+    const bool greater = valid && value.key > prefix;
+    const bool equal = valid && value.key == prefix;
+    const uint32_t greater_mask = __ballot_sync(0xffffffffULL, greater);
+    const uint32_t equal_mask = __ballot_sync(0xffffffffULL, equal);
+    if (lane == 0) {
+        wave_counts[warp] = __popc(greater_mask);
+        equal_counts[warp] = __popc(equal_mask);
+    }
+    __syncthreads();
+    int before_greater = 0, before_equal = 0, total_greater = 0;
+#pragma unroll
+    for (int w = 0; w < BLOCK / WAVE; ++w) {
+        total_greater += wave_counts[w];
+        if (w < warp) {
+            before_greater += wave_counts[w];
+            before_equal += equal_counts[w];
+        }
+    }
+    const uint32_t lower_lanes = (uint32_t(1) << lane) - 1;
+    int pos = limit;
+    if (greater) {
+        pos = before_greater + __popc(greater_mask & lower_lanes);
+    } else if (equal) {
+        pos = total_greater + before_equal + __popc(equal_mask & lower_lanes);
+    }
+    if (pos < limit) {
+        const size_t offset = size_t(row) * output_cols + blockIdx.x * k + pos;
+        if constexpr (last) {
+            dst[offset] = value.index;
+        } else {
+            output[offset] = value;
+        }
+    }
+}
+
+static void top_k_tournament_cuda(
+        ggml_cuda_pool & pool, const float * src, int * dst,
+        int ncols, int nrows, int k, cudaStream_t stream) {
+    constexpr int BLOCK = 256;
+    const int first_count = (ncols / BLOCK) * k + std::min(k, ncols % BLOCK);
+    ggml_cuda_pool_alloc<top_k_pair> scratch0(pool, size_t(first_count) * nrows);
+    ggml_cuda_pool_alloc<top_k_pair> scratch1(pool, size_t(first_count) * nrows);
+    top_k_pair * buffers[] = {scratch0.get(), scratch1.get()};
+    bool first = true;
+    int buffer = 0;
+    while (ncols > k) {
+        const int next_count = (ncols / BLOCK) * k + std::min(k, ncols % BLOCK);
+        const ggml_cuda_kernel_launch_params params(dim3((ncols + BLOCK - 1) / BLOCK, nrows), dim3(BLOCK), 0, stream);
+        if (first) {
+            ggml_cuda_kernel_launch(top_k_tournament<true, false>, params,
+                src, buffers[buffer], buffers[buffer ^ 1], dst, ncols, next_count, k);
+        } else if (next_count == k) {
+            ggml_cuda_kernel_launch(top_k_tournament<false, true>, params,
+                src, buffers[buffer], buffers[buffer ^ 1], dst, ncols, next_count, k);
+        } else {
+            ggml_cuda_kernel_launch(top_k_tournament<false, false>, params,
+                src, buffers[buffer], buffers[buffer ^ 1], dst, ncols, next_count, k);
+        }
+        ncols = next_count;
+        buffer ^= 1;
+        first = false;
+    }
+}
+
 struct top_k_radix_state {
     uint32_t prefix;
     uint32_t prefix_mask;
@@ -260,7 +397,16 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        static const bool tournament = []() {
+            const char * env = getenv("GGML_HIP_TOPK_TOURNAMENT");
+            return env && std::atoi(env) != 0;
+        }();
+        const int cc = ggml_cuda_info().devices[ctx.device].cc;
+        if (tournament && GGML_CUDA_CC_IS_RDNA4(cc) && k >= 1 && k <= 32 && nrows <= 4 && ncols <= (1 << 20)) {
+            top_k_tournament_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        } else {
+            top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
+        }
     } else {
 #endif // defined(GGML_USE_HIP)
         ggml_cuda_pool_alloc<int> temp_dst_alloc(pool, ncols * nrows);

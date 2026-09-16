@@ -1,6 +1,8 @@
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
+#include <cstdlib>
+
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key_or_arr(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp_arr, hparams.n_layer_all, false);
     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
@@ -374,10 +376,27 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     GGML_ASSERT(ubatch.equal_seqs());
     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
 
+    // Keep the shared projection input alive when direct gate outputs are requested.
+    const char *keep_env=std::getenv("LLAMA_GDN_KEEP_INPUT");
+    if(keep_env && std::atoi(keep_env)!=0 && ubatch.n_tokens==1 && n_embd==2048) {
+        ggml_set_output(cur);
+    }
+
     // Input projections
     auto qkvz = build_qkvz(cur, il);
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
+
+    const char * early_z_env = std::getenv("LLAMA_GDN_EARLY_Z");
+    const int early_z = early_z_env ? std::atoi(early_z_env) : 0;
+    if (early_z > 0 && ubatch.n_tokens == 1 && n_embd == 2048) {
+        // Schedule independent projections before recurrent state work.
+        if (early_z == 2) {
+            ggml_build_forward_expand(gf, qkv_mixed);
+        }
+        ggml_build_forward_expand(gf, z);
+        if (early_z == 3) { ggml_build_forward_expand(gf, qkv_mixed); }
+    }
 
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
@@ -406,10 +425,20 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     const int64_t conv_kernel_size = conv_kernel->ne[0];
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
+    const char * prefill_state_env = std::getenv("LLAMA_GDN_PREFILL_EARLY_STATE");
+    const bool early_state = prefill_state_env && std::atoi(prefill_state_env) != 0 &&
+        n_seq_tokens >= 32 && n_seqs == 1 && cparams.n_rs_seq == 0;
+    ggml_tensor * state = nullptr;
+    if (early_state) {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+        ggml_build_forward_expand(gf, state);
+    }
     ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
-
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    if (!state) {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+        state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    }
     cb(state, "state_predelta", il);
 
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
@@ -495,22 +524,36 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     // Check if this is an MoE layer
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
-    ggml_tensor * moe_out =
-        build_moe_ffn(cur,
-            model.layers[il].ffn_gate_inp,
-            model.layers[il].ffn_up_exps,
-            model.layers[il].ffn_gate_exps,
-            model.layers[il].ffn_down_exps,
-            nullptr,
-            n_expert, n_expert_used,
-            LLM_FFN_SILU, true,
-            hparams.expert_weights_scale,
-            LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
-            nullptr, model.layers[il].ffn_gate_up_exps,
-            model.layers[il].ffn_up_exps_s,
-            model.layers[il].ffn_gate_exps_s,
-            model.layers[il].ffn_down_exps_s);
-    cb(moe_out, "ffn_moe_out", il);
+    const char * early_env=std::getenv("LLAMA_MOE_EARLY_SHARED");
+    const int early=ubatch.n_tokens==1 && n_embd==2048 && early_env ? std::atoi(early_env) : 0;
+    const char *gate_env=std::getenv("LLAMA_MOE_EARLY_GATE");
+    const bool early_gate=gate_env && std::atoi(gate_env)!=0 && ubatch.n_tokens==1 && n_embd==2048;
+    ggml_tensor *shared_gate_early=nullptr;
+    auto build_routed=[&]() {
+        if(early_gate && model.layers[il].ffn_gate_inp_shexp) {
+            shared_gate_early=build_lora_mm(model.layers[il].ffn_gate_inp_shexp,cur);
+            ggml_build_forward_expand(gf,shared_gate_early);
+        }
+        ggml_tensor * moe_out =
+            build_moe_ffn(cur,
+                model.layers[il].ffn_gate_inp,
+                model.layers[il].ffn_up_exps,
+                model.layers[il].ffn_gate_exps,
+                model.layers[il].ffn_down_exps,
+                nullptr,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, true,
+                hparams.expert_weights_scale,
+                LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+                nullptr, model.layers[il].ffn_gate_up_exps,
+                model.layers[il].ffn_up_exps_s,
+                model.layers[il].ffn_gate_exps_s,
+                model.layers[il].ffn_down_exps_s);
+        cb(moe_out, "ffn_moe_out", il);
+
+        return moe_out;
+    };
+    ggml_tensor * moe_out=early ? nullptr : build_routed();
 
     // Add shared experts if present - following Qwen3Next reference implementation
     if (model.layers[il].ffn_up_shexp != nullptr) {
@@ -521,12 +564,20 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
                 model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
                 NULL,
                 LLM_FFN_SILU, LLM_FFN_PAR, il);
+        if (early) {
+            if (early==2 && ffn_shexp->op==GGML_OP_MUL_MAT) {
+                ggml_build_forward_expand(gf,ffn_shexp->src[1]);
+            } else {
+                ggml_build_forward_expand(gf,ffn_shexp);
+            }
+            moe_out=build_routed();
+        }
         cb(ffn_shexp, "ffn_shexp", il);
 
         // Apply shared expert gating as in the reference implementation
         // The shared expert has its own gate that is sigmoided
         // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+        ggml_tensor * shared_gate = shared_gate_early ? shared_gate_early : build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
         cb(shared_gate, "shared_expert_gate", il);
 
         // Apply sigmoid to the gate
@@ -541,6 +592,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
     } else {
+        if (early) { moe_out=build_routed(); }
         cur = moe_out;
     }
 

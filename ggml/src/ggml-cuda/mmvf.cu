@@ -383,6 +383,54 @@ static __global__ void mul_mat_vec_f(
     }
 }
 
+#if defined(GGML_USE_HIP)
+// Preserve the 256-thread reduction while assigning two virtual threads to each physical thread.
+template <int n_tokens>
+static __global__ void __launch_bounds__(128)
+mul_mat_vec_f_router_exact(const float * x, const float * y, float * dst, int nrows) {
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int row = blockIdx.x;
+    const float2 * x2 = reinterpret_cast<const float2 *>(x + row * 2048);
+    const float2 * y2 = reinterpret_cast<const float2 *>(y);
+    float sums[2][n_tokens]{};
+    for (int col = tid; col < 1024; col += 256) {
+#pragma unroll
+        for (int group = 0; group < 2; ++group) {
+            const float2 weight = x2[col + group * 128];
+#pragma unroll
+            for (int t = 0; t < n_tokens; ++t) {
+                const float2 input = y2[t * 1024 + col + group * 128];
+                ggml_cuda_mad(sums[group][t], weight.x, input.x);
+                ggml_cuda_mad(sums[group][t], weight.y, input.y);
+            }
+        }
+    }
+    __shared__ float partial[n_tokens][8];
+#pragma unroll
+    for (int group = 0; group < 2; ++group) {
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            sums[group][t] = warp_reduce_sum<32>(sums[group][t]);
+            if (lane == 0) {
+                partial[t][tid / 32 + group * 4] = sums[group][t];
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < 32) {
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            float sum = tid < 8 ? partial[t][tid] : 0.0f;
+            sum = warp_reduce_sum<32>(sum);
+            if (tid == t) {
+                dst[t * nrows + row] = sum;
+            }
+        }
+    }
+}
+#endif
+
 template<typename T, typename type_acc, int ncols_dst, int block_size, bool is_multi_token_id = false>
 static void mul_mat_vec_f_switch_fusion(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -434,6 +482,24 @@ void launch_mul_mat_vec_f_cuda(
 
     const int device = ggml_cuda_get_device();
     const int warp_size = ggml_cuda_info().devices[device].warp_size;
+#if defined(GGML_USE_HIP)
+    if constexpr (std::is_same_v<T, float> && ncols_dst >= 1 && ncols_dst <= 4 && !is_multi_token_id) {
+        static const bool exact_router = [] {
+            const char * value = std::getenv("GGML_HIP_F32_ROUTER_EXACT");
+            return value && std::atoi(value) != 0;
+        }();
+        if (exact_router && !ids && !fusion.gate && !fusion.x_bias && !fusion.gate_bias &&
+                ncols == 2048 && nrows >= 128 && nrows <= 512 && stride_row == 2048 &&
+                stride_col_y == 2048 && stride_col_dst == nrows && nchannels_x == 1 &&
+                nchannels_y == 1 && nchannels_dst == 1 && nsamples_x == 1 && nsamples_dst == 1 &&
+                reinterpret_cast<uintptr_t>(x) % 8 == 0 && reinterpret_cast<uintptr_t>(y) % 8 == 0 &&
+                GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[device].cc)) {
+            const ggml_cuda_kernel_launch_params params(dim3(nrows), 128, 0, stream);
+            ggml_cuda_kernel_launch(mul_mat_vec_f_router_exact<ncols_dst>, params, x, y, dst, int(nrows));
+            return;
+        }
+    }
+#endif
 
     int64_t block_size_best = warp_size;
     int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
@@ -873,3 +939,120 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return false;
     }
 }
+
+#if defined(GGML_USE_HIP)
+template<int tokens>
+static __global__ void gdn_gates_f32(
+        const float * alpha, const float * beta, const float * input,
+        const float * bias, const float * scale, float * output, float * beta_output, int heads) {
+    const int tid = threadIdx.x;
+    const int row = blockIdx.x;
+    const bool is_alpha = blockIdx.y == 0;
+    const float2 * weights = reinterpret_cast<const float2 *>(is_alpha ? alpha : beta) + row * 1024;
+    const float2 * x = reinterpret_cast<const float2 *>(input);
+    __shared__ float partial[32];
+    if (tid < 32) { partial[tid] = 0.0f; }
+    __syncthreads();
+    float sums[tokens] = {};
+    for (int col = tid; col < 1024; col += 256) {
+        const float2 w = weights[col];
+#pragma unroll
+        for (int j = 0; j < tokens; ++j) {
+            const float2 y = x[j * 1024 + col];
+            ggml_cuda_mad(sums[j], w.x, y.x);
+            ggml_cuda_mad(sums[j], w.y, y.y);
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < tokens; ++j) {
+        sums[j] = warp_reduce_sum<32>(sums[j]);
+        if (tid % 32 == 0) { partial[tid / 32] = sums[j]; }
+        __syncthreads();
+        if (tid < 32) { sums[j] = warp_reduce_sum<32>(partial[tid]); }
+        __syncthreads();
+    }
+    if (tid < tokens) {
+        float value = sums[tid];
+        if (is_alpha) {
+            value += bias[row];
+            value = value > 20.0f ? value : logf(1.0f + expf(value));
+            value *= scale[row];
+        } else {
+            value = 1.0f / (1.0f + expf(-value));
+        }
+        (is_alpha ? output : beta_output)[tid * heads + row] = value;
+    }
+}
+
+void ggml_cuda_gdn_gates_f32(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * alpha, const ggml_tensor * beta, const ggml_tensor * input,
+        const ggml_tensor * bias, const ggml_tensor * scale, float * output, float * beta_output) {
+    const ggml_cuda_kernel_launch_params params(dim3(alpha->ne[1], 2), dim3(256), 0, ctx.stream());
+    auto launch = [&](auto n) {
+        ggml_cuda_kernel_launch(gdn_gates_f32<decltype(n)::value>, params,
+            static_cast<const float *>(alpha->data), static_cast<const float *>(beta->data),
+            static_cast<const float *>(input->data), static_cast<const float *>(bias->data),
+            static_cast<const float *>(scale->data), output, beta_output, int(alpha->ne[1]));
+    };
+    switch (input->ne[1]) {
+        case 1: launch(std::integral_constant<int, 1>{}); break;
+        case 2: launch(std::integral_constant<int, 2>{}); break;
+        case 3: launch(std::integral_constant<int, 3>{}); break;
+        case 4: launch(std::integral_constant<int, 4>{}); break;
+        default: GGML_ABORT("unsupported GDN gate batch");
+    }
+}
+#endif
+
+#if defined(GGML_USE_HIP)
+template <int n_tokens>
+static __global__ void __launch_bounds__(128)
+router_pair_f32(const float * x, const float * y, float * dst, int nrows,const float *gate,float *gate_out) {
+    const int tid = threadIdx.x;
+    const int lane = tid % 32;
+    const int row = blockIdx.x;
+    const float2 * x2 = reinterpret_cast<const float2 *>(row==256 ? gate : x + row * 2048);
+    const float2 * y2 = reinterpret_cast<const float2 *>(y);
+    float sums[2][n_tokens]{};
+    for (int col = tid; col < 1024; col += 256) {
+#pragma unroll
+        for (int group = 0; group < 2; ++group) {
+            const float2 weight = x2[col + group * 128];
+#pragma unroll
+            for (int t = 0; t < n_tokens; ++t) {
+                const float2 input = y2[t * 1024 + col + group * 128];
+                ggml_cuda_mad(sums[group][t], weight.x, input.x);
+                ggml_cuda_mad(sums[group][t], weight.y, input.y);
+            }
+        }
+    }
+    __shared__ float partial[n_tokens][8];
+#pragma unroll
+    for (int group = 0; group < 2; ++group) {
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            sums[group][t] = warp_reduce_sum<32>(sums[group][t]);
+            if (lane == 0) {
+                partial[t][tid / 32 + group * 4] = sums[group][t];
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < 32) {
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            float sum = tid < 8 ? partial[t][tid] : 0.0f;
+            sum = warp_reduce_sum<32>(sum);
+            if (tid == t) {
+                if(row==256) { gate_out[t]=sum; } else { dst[t*nrows+row]=sum; }
+            }
+        }
+    }
+}
+void ggml_cuda_router_pair(ggml_backend_cuda_context &ctx,ggml_tensor *router,ggml_tensor *gate) {
+    const ggml_cuda_kernel_launch_params params(dim3(257),dim3(128),0,ctx.stream());
+    ggml_cuda_kernel_launch(router_pair_f32<1>,params,
+        static_cast<const float *>(router->src[0]->data),static_cast<const float *>(router->src[1]->data),
+        static_cast<float *>(router->data),256,static_cast<const float *>(gate->src[0]->data),static_cast<float *>(gate->data));
+}
+#endif

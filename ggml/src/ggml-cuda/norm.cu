@@ -696,3 +696,172 @@ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     l2_norm_f32_cuda(src0_d, dst_d, ne00, ne01, ne02, ne03, s01, s02, s03, eps, stream);
 }
+
+#if defined(GGML_USE_HIP)
+static __global__ void rms_norm_scale_128_f32(const float * x, float * dst,
+        int64_t stride_row, int64_t stride_channel, float eps, float post_scale, float post_bias) {
+    const int row = blockIdx.x, channel = blockIdx.y, tid = threadIdx.x;
+    x += row * stride_row + channel * stride_channel;
+    dst += (channel * gridDim.x + row) * 128;
+    float tmp = 0.0f;
+    if (tid < 128) { const float xi = x[tid]; tmp += xi * xi; }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / 128 + eps);
+    if (tid < 128) {
+        const float normalized = scale * x[tid];
+        dst[tid] = post_scale * normalized + post_bias;
+    }
+}
+
+void ggml_cuda_op_rms_norm_scale_128(ggml_backend_cuda_context & ctx, const ggml_tensor * norm, ggml_tensor * dst) {
+    const auto * x = norm->src[0];
+    float eps, scale, bias;
+    memcpy(&eps, norm->op_params, sizeof(float));
+    memcpy(&scale, reinterpret_cast<const float *>(dst->op_params), sizeof(float));
+    memcpy(&bias, reinterpret_cast<const float *>(dst->op_params) + 1, sizeof(float));
+    GGML_ASSERT(x->ne[0] == 128 && x->ne[3] == 1 && x->nb[0] == sizeof(float));
+    const ggml_cuda_kernel_launch_params params(dim3(x->ne[1], x->ne[2]), dim3(256), 32 * sizeof(float), ctx.stream());
+    ggml_cuda_kernel_launch(rms_norm_scale_128_f32, params, static_cast<const float *>(x->data),
+        static_cast<float *>(dst->data), int64_t(x->nb[1]/sizeof(float)), int64_t(x->nb[2]/sizeof(float)), eps, scale, bias);
+}
+#endif
+
+#if defined(GGML_USE_HIP)
+struct rms_scale_pair_args {
+    const float * x[2];
+    float * dst[2];
+    int64_t stride_row[2], stride_channel[2];
+    float eps[2], scale[2], bias[2];
+};
+
+static __global__ void rms_norm_scale_pair_128_f32(rms_scale_pair_args args) {
+    const int part = blockIdx.z, row = blockIdx.x, channel = blockIdx.y, tid = threadIdx.x;
+    const float * x = args.x[part] + row * args.stride_row[part] + channel * args.stride_channel[part];
+    float * dst = args.dst[part] + (channel * gridDim.x + row) * 128;
+    float tmp = 0.0f;
+    if (tid < 128) { const float xi = x[tid]; tmp += xi * xi; }
+    extern __shared__ float s_sum[];
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, s_sum);
+    const float scale = rsqrtf(tmp / 128 + args.eps[part]);
+    if (tid < 128) {
+        const float normalized = scale * x[tid];
+        dst[tid] = args.scale[part] * normalized + args.bias[part];
+    }
+}
+
+void ggml_cuda_op_rms_norm_scale_pair_128(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * norm_a, ggml_tensor * dst_a, const ggml_tensor * norm_b, ggml_tensor * dst_b) {
+    const ggml_tensor * norms[] = {norm_a, norm_b};
+    ggml_tensor * outputs[] = {dst_a, dst_b};
+    rms_scale_pair_args args{};
+    for (int i = 0; i < 2; ++i) {
+        const auto * x = norms[i]->src[0];
+        args.x[i] = static_cast<const float *>(x->data);
+        args.dst[i] = static_cast<float *>(outputs[i]->data);
+        args.stride_row[i] = x->nb[1]/sizeof(float);
+        args.stride_channel[i] = x->nb[2]/sizeof(float);
+        memcpy(&args.eps[i], norms[i]->op_params, sizeof(float));
+        memcpy(&args.scale[i], outputs[i]->op_params, sizeof(float));
+        memcpy(&args.bias[i], reinterpret_cast<const float *>(outputs[i]->op_params) + 1, sizeof(float));
+    }
+    const ggml_cuda_kernel_launch_params params(dim3(norm_a->ne[1], norm_a->ne[2], 2), dim3(256), 32*sizeof(float), ctx.stream());
+    ggml_cuda_kernel_launch(rms_norm_scale_pair_128_f32, params, args);
+}
+#endif
+
+#if defined(GGML_USE_HIP)
+template<int width, bool chain, bool gated>
+static __global__ void residual_rms_f32(const float * a, const float * b, const float * weight,
+                                      float * residual, float * normalized, float eps, const float * c, const float * gate) {
+    const int tid = threadIdx.x, base = blockIdx.x * width;
+    float values[width/1024];
+    float sum = 0.0f;
+    const float factor = gated ? 1.0f / (1.0f + expf(-gate[blockIdx.x])) : 1.0f;
+#pragma unroll
+    for (int j = 0; j < width/1024; ++j) {
+        const int col = tid + j*1024;
+        if constexpr (gated) {
+#pragma clang fp contract(off)
+            // HIP __fmul_rn can contract after inlining; preserve the graph's two roundings.
+            const float scaled = b[base+col] * factor;
+            values[j] = a[base+col] + scaled;
+        } else { values[j] = a[base+col] + b[base+col]; }
+        if constexpr (chain) { values[j] += c[base+col]; }
+        // Preserve the contraction order of the original RMS loop.
+        sum = fmaf(values[j], values[j], sum);
+    }
+    extern __shared__ float s_sum[];
+    sum = block_reduce<block_reduce_method::SUM, 1024>(sum, s_sum);
+    const float scale = rsqrtf(sum/width + eps);
+#pragma unroll
+    for (int j = 0; j < width/1024; ++j) {
+        const int col = tid + j*1024;
+        residual[base+col] = values[j];
+        normalized[base+col] = scale * values[j] * weight[col];
+    }
+}
+
+void ggml_cuda_op_residual_rms(ggml_backend_cuda_context & ctx, ggml_tensor * add,
+                             const ggml_tensor * norm, const ggml_tensor * weight, ggml_tensor * dst,
+                             const ggml_tensor * first, const ggml_tensor * gated_mul) {
+    float eps; memcpy(&eps, norm->op_params, sizeof(float));
+    const ggml_cuda_kernel_launch_params params(dim3(add->ne[1]), dim3(1024), 32*sizeof(float), ctx.stream());
+    const auto * input = first ? first : add;
+    const auto launch = [&](auto width, auto chain, auto gated) {
+        ggml_cuda_kernel_launch(residual_rms_f32<decltype(width)::value, decltype(chain)::value, decltype(gated)::value>, params,
+            static_cast<const float *>(input->src[0]->data), static_cast<const float *>((gated_mul ? gated_mul->src[0] : input->src[1])->data),
+            static_cast<const float *>(weight->data), static_cast<float *>(add->data), static_cast<float *>(dst->data), eps,
+            first ? static_cast<const float *>(add->src[1]->data) : nullptr,
+            gated_mul ? static_cast<const float *>(gated_mul->src[1]->src[0]->data) : nullptr);
+    };
+    const auto launch_width = [&](auto width) {
+        if (gated_mul) { launch(width, std::true_type{}, std::true_type{}); }
+        else if (first) { launch(width, std::true_type{}, std::false_type{}); }
+        else { launch(width, std::false_type{}, std::false_type{}); }
+    };
+    if (add->ne[0] == 2048) { launch_width(std::integral_constant<int, 2048>{}); }
+    else { GGML_ASSERT(add->ne[0] == 5120); launch_width(std::integral_constant<int, 5120>{}); }
+}
+#endif
+
+#if defined(GGML_USE_HIP)
+template<bool quantize>
+static __global__ void rms_norm_gate_128_f32(const float * x, const float * weight,
+        const float * gate, float * dst, float eps, block_q8_1 * quantized) {
+    const int tid = threadIdx.x, offset = blockIdx.x * 128;
+    float tmp = 0.0f;
+    if (tid < 128) { const float v = x[offset + tid]; tmp += v * v; }
+    extern __shared__ float partial[];
+    tmp = block_reduce<block_reduce_method::SUM, 256>(tmp, partial);
+    const float scale = rsqrtf(tmp / 128 + eps);
+    if (tid < 128) {
+        const float normalized = scale * x[offset + tid] * weight[tid];
+        const float g = gate[offset + tid];
+        const float silu = g / (1.0f + expf(-g));
+        const float value = normalized * silu;
+        dst[offset + tid] = value;
+        if constexpr (quantize) {
+            const float amax = warp_reduce_max<32>(fabsf(value));
+            const float sum = warp_reduce_sum<32>(value);
+            const float d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(value / d);
+            const int block = (offset + tid) / 32, lane = tid % 32;
+            quantized[block].qs[lane] = q;
+            if (lane == 0) { quantized[block].ds = make_half2(d,sum); }
+        }
+    }
+}
+
+void ggml_cuda_op_rms_norm_gate_128(ggml_backend_cuda_context & ctx, const ggml_tensor * norm,
+        const ggml_tensor * weight, const ggml_tensor * gate, ggml_tensor * dst, void * quantized) {
+    const ggml_cuda_kernel_launch_params params(dim3(ggml_nelements(dst)/128), dim3(256), 32*sizeof(float), ctx.stream());
+    const auto launch = [&](auto flag) {
+        ggml_cuda_kernel_launch(rms_norm_gate_128_f32<decltype(flag)::value>, params,
+            static_cast<const float *>(norm->src[0]->data), static_cast<const float *>(weight->data),
+            static_cast<const float *>(gate->data), static_cast<float *>(dst->data), ggml_get_op_params_f32(norm, 0),
+            static_cast<block_q8_1 *>(quantized));
+    };
+    if (quantized) { launch(std::true_type{}); } else { launch(std::false_type{}); }
+}
+#endif

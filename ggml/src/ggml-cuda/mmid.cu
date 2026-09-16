@@ -149,9 +149,70 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
+#if defined(GGML_USE_HIP)
+// Each wave scans a consecutive slot range; prefix counts preserve token order.
+template<int warps>
+static __global__ void __launch_bounds__(32*warps)
+mm_ids_parallel_8(const int32_t * ids, int32_t * ids_src1, int32_t * ids_dst, int32_t * bounds,
+                  int tokens, int channels, int si1, int sis1, bool inverse) {
+    const int lane = threadIdx.x, wave = threadIdx.y, expert = blockIdx.x;
+    const int slots = tokens*8;
+    const int span = ((slots + warps*32 - 1)/(warps*32))*32;
+    const int begin = wave*span, end = min(begin+span,slots);
+    int lower = 0, count = 0;
+    __shared__ int counts[warps], lowers[warps];
+    for (int i=begin+lane;i<end;i+=32) {
+        const int id = ids[(i/8)*si1+i%8];
+        lower += id < expert;
+        count += id == expert;
+    }
+    lower = warp_reduce_sum<32>(lower);
+    count = warp_reduce_sum<32>(count);
+    if (lane == 0) { counts[wave]=count; lowers[wave]=lower; }
+    __syncthreads();
+    int base=0, preceding=0, total=0;
+#pragma unroll
+    for (int w=0;w<warps;++w) {
+        base+=lowers[w];
+        if (w<wave) { preceding+=counts[w]; }
+        total+=counts[w];
+    }
+    if (lane==0 && wave==0) {
+        bounds[expert]=base;
+        if (expert==int(gridDim.x)-1) { bounds[gridDim.x]=base+total; }
+    }
+    int compact=base+preceding;
+    for (int i0=begin;i0<end;i0+=32) {
+        const int i=i0+lane;
+        const bool match=i<end && ids[(i/8)*si1+i%8]==expert;
+        const unsigned mask=__ballot_sync(0xffffffffULL,match);
+        if (match) {
+            const int dest=compact+__popc(mask & ((1u<<lane)-1));
+            ids_dst[dest]=i;
+            if (inverse) { ids_src1[i]=dest; }
+            else { ids_src1[dest]=(i/8)*sis1+(i%8)%channels; }
+        }
+        compact+=__popc(mask);
+    }
+}
+#endif
+
 void ggml_cuda_launch_mm_ids_helper(
         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
         const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+#if defined(GGML_USE_HIP)
+    static const int parallel = []() {
+        const char * env = getenv("GGML_HIP_MOE_IDS_PARALLEL");
+        return env ? std::atoi(env) : 0;
+    }();
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (parallel && GGML_CUDA_CC_IS_RDNA4(cc) && n_expert_used == 8 &&
+            n_tokens >= 32 && n_tokens < (1 << 22)) {
+        mm_ids_parallel_8<4><<<n_experts,dim3(32,4),0,stream>>>(
+            ids,ids_src1,ids_dst,expert_bounds,n_tokens,nchannels_y,si1,sis1,write_inverse);
+        return;
+    }
+#endif
     switch (n_expert_used) {
         case  2:
             launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);

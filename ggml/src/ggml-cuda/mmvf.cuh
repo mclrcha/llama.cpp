@@ -12,3 +12,13 @@ void ggml_cuda_op_mul_mat_vec_f(
     const int64_t src1_padded_row_size, cudaStream_t stream);
 
 bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0_ne, const size_t * src0_nb, int64_t ne11);
+
+#if defined(GGML_USE_HIP)
+void ggml_cuda_gdn_gates_f32(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * alpha, const ggml_tensor * beta, const ggml_tensor * input,
+        const ggml_tensor * bias, const ggml_tensor * scale, float * output, float * beta_output);
+#endif
+
+#if defined(GGML_USE_HIP)
+void ggml_cuda_router_pair(ggml_backend_cuda_context &ctx,ggml_tensor *router,ggml_tensor *gate);
+#endif

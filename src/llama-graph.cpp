@@ -3487,7 +3487,10 @@ ggml_tensor * llm_graph_context::build_rs(
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
     // {state_size, rs_size} -> {state_size, n_seqs}
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
-    ggml_build_forward_expand(gf, output_states);
+    const char * defer_env = std::getenv("LLAMA_GDN_DEFER_STATE");
+    const bool defer = defer_env && std::atoi(defer_env) != 0 && ubatch.n_tokens == 1 &&
+        n_rs == 1 && n_seqs == 1 && state_size >= 128*128;
+    if (!defer) { ggml_build_forward_expand(gf, output_states); }
 
     // copy extra states which won't be changed further (between n_seqs and n_rs)
     ggml_tensor * states_extra = ggml_get_rows(ctx0, states, state_copy_extra);

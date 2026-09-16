@@ -68,3 +68,8 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     int64_t         nrows_dst,
                                     int             n_expert_used,
                                     cudaStream_t    stream);
+
+#if defined(GGML_USE_HIP)
+void quantize_mmq_silu_cuda(const float * gate,const float * up,void * dst,ggml_type type,
+    int64_t k,int64_t n,cudaStream_t stream,const int32_t * ids = nullptr);
+#endif

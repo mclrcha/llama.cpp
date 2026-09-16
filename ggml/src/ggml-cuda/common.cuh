@@ -1262,6 +1262,22 @@ struct ggml_tensor_extra_gpu {
 #define USE_CUDA_GRAPH
 #endif
 
+struct ggml_cuda_graph_key {
+    const void * first_node = nullptr;
+    int64_t n_tokens = 0;
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return first_node == other.first_node && n_tokens == other.n_tokens;
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & key) const {
+        const size_t seed = std::hash<const void *>{}(key.first_node);
+        return seed ^ (std::hash<int64_t>{}(key.n_tokens) + 0x9e3779b9 + (seed << 6) + (seed >> 2));
+    }
+};
+
 struct ggml_cuda_graph {
 #ifdef USE_CUDA_GRAPH
     ~ggml_cuda_graph() {
@@ -1446,6 +1462,32 @@ struct ggml_cuda_stream_context {
     }
 };
 
+#if defined(GGML_USE_HIP)
+struct ggml_hip_mmvq_cache {
+    static constexpr size_t capacity = 1 << 20;
+    void * data = nullptr;
+    const ggml_tensor * src = nullptr;
+    bool enabled = false;
+
+    char * acquire(const ggml_tensor * source, bool & reuse) {
+        reuse = src == source;
+        src = source;
+        return static_cast<char *>(data);
+    }
+
+    void invalidate_write(const ggml_tensor * dst) {
+        if (!src) {
+            return;
+        }
+        const uintptr_t a = reinterpret_cast<uintptr_t>(src->data);
+        const uintptr_t b = reinterpret_cast<uintptr_t>(dst->data);
+        if (a < b + ggml_nbytes(dst) && b < a + ggml_nbytes(src)) {
+            src = nullptr;
+        }
+    }
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1458,14 +1500,17 @@ struct ggml_backend_cuda_context {
 
     int curr_stream_no = 0;
 
+#if defined(GGML_USE_HIP)
+    ggml_hip_mmvq_cache mmvq_cache;
+#endif
+
 #ifdef USE_CUDA_GRAPH
-    // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
-    // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // Cache each first node and optional short-graph token count separately.
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & graph_key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1480,9 +1525,9 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;
         return it->second.get();

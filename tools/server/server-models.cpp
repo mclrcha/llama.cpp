@@ -1129,7 +1129,8 @@ void server_models::load(const std::string & name, const load_options & opts) {
     // exceeding models_max. Without this, the window between unload_lru()
     // releasing its lock and this lock_guard acquiring allows multiple
     // threads to each observe capacity and all proceed to load.
-    if (base_params.models_max > 0) {
+    // Download workers do not use models_max slots.
+    if (opts.mode == SERVER_CHILD_MODE_NORMAL && base_params.models_max > 0) {
         size_t count_active = 0;
         for (const auto & m : mapping) {
             if (m.second.meta.is_running()) {
@@ -1786,7 +1787,10 @@ void server_child::notify_to_router(const std::string & state, const json & payl
     std::lock_guard<std::mutex> lk(mtx_stdout);
     common_log_pause(common_log_main());
     fflush(stdout);
-    fprintf(stdout, "%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
+    // the router matches the command on a line prefix, so the leading newline
+    // closes whatever the logger left open on the shared pipe, down to the
+    // trailing color reset that carries no newline of its own
+    fprintf(stdout, "\n%s%s\n", CMD_CHILD_TO_ROUTER_STATE, safe_json_to_str(data).c_str());
     fflush(stdout);
     common_log_resume(common_log_main());
 }

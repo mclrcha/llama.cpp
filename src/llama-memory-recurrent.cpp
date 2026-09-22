@@ -682,8 +682,15 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             }
         }
 
-        rs_z = -1;
+        // Only zero a state when a cell needs it: during decoding every cell already has a source, and clearing an
+        // unused (e.g. speculative checkpoint) cell would cost a full state write per recurrent layer.
+        bool need_zero = false;
         for (int i = min; i <= max; ++i) {
+            need_zero = need_zero || cells[i].src < 0;
+        }
+
+        rs_z = -1;
+        for (int i = min; need_zero && i <= max; ++i) {
             if (refcounts[i] == 0) {
                 rs_z = i;
                 break;

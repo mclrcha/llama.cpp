@@ -868,6 +868,37 @@ static __global__ void mul_mat_vec_q(
     }
 }
 
+#if defined(GGML_USE_HIP)
+// Called by a converged warp after it wrote `count` contiguous outputs starting at flat index out0 (same group).
+// The last writer of each group of QK8_1 outputs quantizes it like quantize_q8_1 and resets the group counter.
+static __device__ __forceinline__ void mmvq_q8_out_group(
+        const float * dst, void * q8_out, unsigned int * counters, const uint32_t out0, const unsigned int count) {
+    const int lane = threadIdx.x;
+    const uint32_t group = out0 / QK8_1;
+    __threadfence();
+    unsigned int prev = 0;
+    if (lane == 0) {
+        prev = atomicAdd(counters + group, count);
+    }
+    prev = __shfl(prev, 0, QK8_1);
+    if (prev + count != QK8_1) {
+        return;
+    }
+    __threadfence();
+    const float xi = ((const volatile float *) dst)[group*QK8_1 + lane];
+    const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+    const float sum  = warp_reduce_sum<QK8_1>(xi);
+    const float d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    block_q8_1 * y = (block_q8_1 *) q8_out + group;
+    y->qs[lane] = q;
+    if (lane == 0) {
+        y->ds = make_half2(d, sum);
+        counters[group] = 0;
+    }
+}
+#endif // defined(GGML_USE_HIP)
+
 // Dedicated MoE multi-token kernel.
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
@@ -1011,6 +1042,16 @@ static __global__ void mul_mat_vec_q_moe(
         }
         dst[channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0 + threadIdx.x] = result;
     }
+
+#if defined(GGML_USE_HIP)
+    if constexpr (has_fusion && warp_size == QK8_1) {
+        static_assert(QK8_1 % c_rows_per_block == 0, "a block must not straddle Q8_1 groups");
+        if (fusion.q8_out) {
+            mmvq_q8_out_group(dst_ptr, fusion.q8_out, fusion.q8_counters,
+                channel_dst*stride_channel_dst + token_idx*stride_col_dst + row0, c_rows_per_block);
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, tmp_gate, vgate, x_bias, gate_bias, active_glu, glu_limit, x_scale, gate_scale);
@@ -1533,7 +1574,8 @@ static __device__ __forceinline__ void mixed_mmvq_partial(
 template <ggml_type up_type, ggml_type gate_type, int n_tokens>
 static __global__ void __launch_bounds__(n_tokens == 1 ? 256 : 32)
 mul_mat_vec_q_mixed_rdna4(const void * up, const void * gate, const block_q8_1 * y,
-                        float * dst, int ncols, int nrows, int stride_y) {
+                        float * dst, int ncols, int nrows, int stride_y,
+                        void * q8_out = nullptr, unsigned int * q8_counters = nullptr) {
     constexpr int nwarps = n_tokens == 1 ? 8 : 1;
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
@@ -1585,6 +1627,12 @@ mul_mat_vec_q_mixed_rdna4(const void * up, const void * gate, const block_q8_1 *
             dst[t * nrows + blockIdx.x] = u[t] * ggml_cuda_op_silu_single(g[t]);
         }
     }
+    }
+    if (q8_out) {
+#pragma unroll
+        for (int t = 0; t < n_tokens; ++t) {
+            mmvq_q8_out_group(dst, q8_out, q8_counters, t*nrows + blockIdx.x, 1);
+        }
     }
 }
 #endif
@@ -1741,13 +1789,27 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
 #if defined(GGML_USE_HIP)
+    // GLU projections (e.g. MoE gate/up) can also write the Q8_1 copy of their output for the down projection.
+    // Only kernels with the Q8_1 epilogue may reserve the cache slot, right before they are launched.
+    static const bool q8_out_env = [] {
+        const char * value = getenv("GGML_HIP_MMVQ_Q8_OUT");
+        return !value || std::atoi(value) != 0;
+    }();
+    const bool q8_out_ok = q8_out_env && fusion && fusion->gate && cache.enabled && ctx.curr_stream_no == 0 &&
+        GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc) && dst->ne[3] == 1 && ggml_is_contiguous(dst) &&
+        dst->ne[0] % MATRIX_ROW_PADDING == 0 && ggml_nelements(dst)/QK8_1 <= cache.ncounters &&
+        size_t(ggml_nelements(dst)/QK8_1)*sizeof(block_q8_1) <= cache.capacity;
+#endif
+
+#if defined(GGML_USE_HIP)
     if (fusion && fusion->gate && !fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale &&
             ggml_cuda_can_fuse_shared_q8(src0, fusion->gate, src1, dst)) {
         const ggml_cuda_kernel_launch_params params(dim3(ne01), dim3(32), 0, stream);
         const auto launch = [&](auto tokens) {
             ggml_cuda_kernel_launch(mul_mat_vec_q_mixed_rdna4<GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, decltype(tokens)::value>, params,
                 src0->data, fusion->gate->data, reinterpret_cast<const block_q8_1 *>(src1_q8_1), dst_d,
-                int(ne00), int(ne01), int(ne10_padded / QK8_1));
+                int(ne00), int(ne01), int(ne10_padded / QK8_1),
+                q8_out_ok ? static_cast<void *>(cache.reserve(dst)) : nullptr, cache.counters());
         };
         switch (ne11) {
             case 2: launch(std::integral_constant<int, 2>{}); break;
@@ -1769,7 +1831,9 @@ void ggml_cuda_mul_mat_vec_q(
             const auto launch_tokens = [&](auto tokens) {
                 ggml_cuda_kernel_launch(mul_mat_vec_q_mixed_rdna4<decltype(up_type)::value, decltype(gate_type)::value, decltype(tokens)::value>, params,
                     src0->data, fusion->gate->data, reinterpret_cast<const block_q8_1 *>(src1_q8_1), dst_d,
-                    int(ne00), int(ne01), int(ne10_padded / QK8_1));
+                    int(ne00), int(ne01), int(ne10_padded / QK8_1),
+                    // With several tokens, the fences of every block outweigh the saved launch for large outputs.
+                    q8_out_ok && (ne11 == 1 || ne01 <= 4096) ? static_cast<void *>(cache.reserve(dst)) : nullptr, cache.counters());
             };
             switch (ne11) {
                 case 1: launch_tokens(std::integral_constant<int, 1>{}); break;
@@ -1828,16 +1892,8 @@ void ggml_cuda_mul_mat_vec_q(
 #endif
 
 #if defined(GGML_USE_HIP)
-    // Single-token GLU projections (e.g. MoE gate/up) also write the Q8_1 copy of their output for the down projection.
-    static const bool q8_out = [] {
-        const char * value = getenv("GGML_HIP_MMVQ_Q8_OUT");
-        return !value || std::atoi(value) != 0;
-    }();
-    if (q8_out && fusion && fusion->gate && cache.enabled && ctx.curr_stream_no == 0 &&
-            GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc) &&
-            (ids ? dst->ne[2] == 1 : dst->ne[1] == 1) && dst->ne[3] == 1 && ggml_is_contiguous(dst) &&
-            dst->ne[0] % MATRIX_ROW_PADDING == 0 && ggml_nelements(dst)/QK8_1 <= cache.ncounters &&
-            size_t(ggml_nelements(dst)/QK8_1)*sizeof(block_q8_1) <= cache.capacity) {
+    // Generic kernel: epilogue for one token; MUL_MAT_ID with several tokens uses mul_mat_vec_q_moe, which has it too.
+    if (q8_out_ok && (ids || dst->ne[1] == 1)) {
         fusion_local.q8_out      = cache.reserve(dst);
         fusion_local.q8_counters = cache.counters();
     }

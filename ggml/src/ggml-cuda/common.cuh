@@ -1472,15 +1472,24 @@ struct ggml_cuda_stream_context {
 // Q8_1 copies of recent matrix-vector inputs. Two slots keep an activation that feeds several projections
 // (e.g. MoE shared expert and routed experts) while a smaller intermediate is quantized in between.
 struct ggml_hip_mmvq_cache {
-    static constexpr size_t capacity = 1 << 20; // per slot
-    static constexpr int    nslots   = 2;
-    void * data = nullptr;                      // nslots*capacity bytes
+    static constexpr size_t capacity  = 1 << 20; // per slot
+    static constexpr int    nslots    = 2;
+    static constexpr int    ncounters = 4096;    // zero-initialized, reset by their users
+    void * data = nullptr;                       // nslots*capacity bytes followed by the counters
     const ggml_tensor * src[nslots] = {nullptr};
     int last = 0;
     bool enabled = false;
 
     char * slot(const int k) const {
         return static_cast<char *>(data) + k*capacity;
+    }
+
+    unsigned int * counters() const {
+        return reinterpret_cast<unsigned int *>(static_cast<char *>(data) + nslots*capacity);
+    }
+
+    static constexpr size_t alloc_size() {
+        return nslots*capacity + ncounters*sizeof(unsigned int);
     }
 
     // Views and reshapes of the same data share a Q8_1 copy; writes are tracked by address in invalidate_write.
@@ -1697,6 +1706,9 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // HIP: optional Q8_1 copy of the output, written by the last block of each group of QK8_1 outputs.
+    void * q8_out = nullptr;
+    unsigned int * q8_counters = nullptr;
 };
 
 struct ggml_cuda_kernel_launch_params {

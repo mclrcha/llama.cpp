@@ -827,6 +827,39 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
+#if defined(GGML_USE_HIP)
+    if constexpr (has_fusion && ncols_dst == 1 && warp_size == QK8_1) {
+        static_assert(QK8_1 % rows_per_cuda_block == 0, "a block must not straddle Q8_1 groups");
+        if (fusion.q8_out) {
+            // The last block to finish a group of QK8_1 outputs quantizes it, with the lane mapping and reductions of
+            // quantize_q8_1. Requires contiguous output rows that are a multiple of QK8_1 per channel.
+            const uint32_t out0  = sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
+            const uint32_t group = out0 / QK8_1;
+            unsigned int * counter = fusion.q8_counters + group;
+            __threadfence();
+            unsigned int prev = 0;
+            if (threadIdx.x == 0) {
+                prev = atomicAdd(counter, rows_per_cuda_block);
+            }
+            prev = __shfl(prev, 0, warp_size);
+            if (prev + rows_per_cuda_block == QK8_1) {
+                __threadfence();
+                const float xi = ((const volatile float *) dst_ptr)[group*QK8_1 + threadIdx.x];
+                const float amax = warp_reduce_max<QK8_1>(fabsf(xi));
+                const float sum  = warp_reduce_sum<QK8_1>(xi);
+                const float d = amax / 127.0f;
+                const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+                block_q8_1 * y = (block_q8_1 *) fusion.q8_out + group;
+                y->qs[threadIdx.x] = q;
+                if (threadIdx.x == 0) {
+                    y->ds = make_half2(d, sum);
+                    *counter = 0;
+                }
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+
     if constexpr (!has_fusion) {
         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, glu_limit, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
     }
@@ -1791,6 +1824,22 @@ void ggml_cuda_mul_mat_vec_q(
             case 4: launch(std::integral_constant<int, 4>{}); break;
         }
         return;
+    }
+#endif
+
+#if defined(GGML_USE_HIP)
+    // Single-token GLU projections (e.g. MoE gate/up) also write the Q8_1 copy of their output for the down projection.
+    static const bool q8_out = [] {
+        const char * value = getenv("GGML_HIP_MMVQ_Q8_OUT");
+        return !value || std::atoi(value) != 0;
+    }();
+    if (q8_out && fusion && fusion->gate && cache.enabled && ctx.curr_stream_no == 0 &&
+            GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc) &&
+            (ids ? dst->ne[2] == 1 : dst->ne[1] == 1) && dst->ne[3] == 1 && ggml_is_contiguous(dst) &&
+            dst->ne[0] % QK8_1 == 0 && ggml_nelements(dst)/QK8_1 <= cache.ncounters &&
+            size_t(ggml_nelements(dst)/QK8_1)*sizeof(block_q8_1) <= cache.capacity) {
+        fusion_local.q8_out      = cache.reserve(dst);
+        fusion_local.q8_counters = cache.counters();
     }
 #endif
 

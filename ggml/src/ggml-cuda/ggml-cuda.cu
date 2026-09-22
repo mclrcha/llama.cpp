@@ -5290,7 +5290,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[cuda_ctx->device].cc);
     // The address remains stable for every captured graph on this context.
     if (cache.enabled && !cache.data) {
-        CUDA_CHECK(cudaMalloc(&cache.data, cache.nslots*cache.capacity));
+        CUDA_CHECK(cudaMalloc(&cache.data, cache.alloc_size()));
+        CUDA_CHECK(cudaMemset(cache.data, 0, cache.alloc_size()));
     }
 #endif
 

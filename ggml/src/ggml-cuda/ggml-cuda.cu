@@ -4173,11 +4173,13 @@ static int ggml_cuda_try_q8_pair(ggml_backend_cuda_context & ctx,ggml_cgraph * g
     auto *a=graph->nodes[i];auto *b=graph->nodes[i+1];
     if(a->op!=GGML_OP_MUL_MAT || b->op!=GGML_OP_MUL_MAT || a->src[1]!=b->src[1]) { return 0; }
     const auto *x=a->src[1];
-    if(x->type!=GGML_TYPE_F32 || x->ne[0]!=2048 || ggml_nelements(x)!=2048) { return 0; }
+    // One token, or up to 4 (speculative verification).
+    const int64_t n_tokens=x->ne[1];
+    if(x->type!=GGML_TYPE_F32 || x->ne[0]!=2048 || n_tokens<1 || n_tokens>4 || ggml_nelements(x)!=2048*n_tokens) { return 0; }
     for(const auto *o:{a,b}) {
         const auto *w=o->src[0];
         if(w->type!=GGML_TYPE_Q8_0 || w->ne[0]!=2048 || w->ne[1]<4096 || w->ne[1]>8192 || w->ne[1]%8 ||
-                ggml_nelements(w)!=2048*w->ne[1] || o->type!=GGML_TYPE_F32 || ggml_nelements(o)!=w->ne[1]) { return 0; }
+                ggml_nelements(w)!=2048*w->ne[1] || o->type!=GGML_TYPE_F32 || ggml_nelements(o)!=w->ne[1]*n_tokens) { return 0; }
     }
     for(const ggml_tensor *t:{x,static_cast<const ggml_tensor *>(a->src[0]),static_cast<const ggml_tensor *>(b->src[0]),
             static_cast<const ggml_tensor *>(a),static_cast<const ggml_tensor *>(b)}) {

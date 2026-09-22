@@ -1639,11 +1639,10 @@ mul_mat_vec_q_mixed_rdna4(const void * up, const void * gate, const block_q8_1 *
 
 #if defined(GGML_USE_HIP)
 // Reuse activations across rows and unroll weight loads, as in the Vulkan matvec shaders.
-template <int n_tokens, int rows_per_wave = 2>
-static __global__ void __launch_bounds__(128)
-mul_mat_vec_q8_0_q8_1_rdna4(const block_q8_0 * __restrict__ x, const block_q8_1 * __restrict__ y,
-                          float * __restrict__ dst, int ncols, int nrows, int stride_y) {
-    const int row = blockIdx.x * (4 * rows_per_wave) + threadIdx.y * rows_per_wave;
+template <int n_tokens, int rows_per_wave>
+static __device__ __forceinline__ void mul_mat_vec_q8_0_q8_1_rdna4_rows(const block_q8_0 * __restrict__ x, const block_q8_1 * __restrict__ y,
+                          float * __restrict__ dst, int ncols, int nrows, int stride_y, int block) {
+    const int row = block * (4 * rows_per_wave) + threadIdx.y * rows_per_wave;
     if (row >= nrows) {
         return;
     }
@@ -1682,6 +1681,26 @@ mul_mat_vec_q8_0_q8_1_rdna4(const block_q8_0 * __restrict__ x, const block_q8_1 
                 dst[t * nrows + row + r] = sum[t][r];
             }
         }
+    }
+}
+
+template <int n_tokens, int rows_per_wave = 2>
+static __global__ void __launch_bounds__(128)
+mul_mat_vec_q8_0_q8_1_rdna4(const block_q8_0 * __restrict__ x, const block_q8_1 * __restrict__ y,
+                          float * __restrict__ dst, int ncols, int nrows, int stride_y) {
+    mul_mat_vec_q8_0_q8_1_rdna4_rows<n_tokens, rows_per_wave>(x, y, dst, ncols, nrows, stride_y, blockIdx.x);
+}
+
+// Two projections of the same activation in one launch: the first blocks compute a, the others b.
+template <int n_tokens, int rows_per_wave>
+static __global__ void __launch_bounds__(128)
+mul_mat_vec_q8_0_q8_1_rdna4_pair(const block_q8_0 * __restrict__ xa, const block_q8_0 * __restrict__ xb,
+                          const block_q8_1 * __restrict__ y, float * __restrict__ da, float * __restrict__ db,
+                          int ncols, int nrows_a, int nrows_b, int blocks_a, int stride_y) {
+    if (int(blockIdx.x) < blocks_a) {
+        mul_mat_vec_q8_0_q8_1_rdna4_rows<n_tokens, rows_per_wave>(xa, y, da, ncols, nrows_a, stride_y, blockIdx.x);
+    } else {
+        mul_mat_vec_q8_0_q8_1_rdna4_rows<n_tokens, rows_per_wave>(xb, y, db, ncols, nrows_b, stride_y, blockIdx.x - blocks_a);
     }
 }
 #endif
@@ -2133,6 +2152,35 @@ void ggml_cuda_q8_pair(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_te
     const auto * input=a->src[1];
     bool reuse=false;
     char * q=ctx.mmvq_cache.acquire(input,reuse);
+    const int n_tokens=int(input->ne[1]);
+    if(n_tokens>1) {
+        // Same kernel and geometry as two separate matrix-vector products of the batch.
+        if(!reuse) {
+            quantize_row_q8_1_cuda(static_cast<const float *>(input->data),nullptr,q,GGML_TYPE_Q8_0,
+                2048,2048,2048*n_tokens,2048*n_tokens,2048,n_tokens,1,1,ctx.stream());
+        }
+        static const bool batch_row1=[] { const char * v=std::getenv("GGML_HIP_Q8_BATCH_ROW1"); return v && std::atoi(v)!=0; }();
+        const auto launch=[&](auto tokens,auto rows) {
+            constexpr int rows_per_block=4*decltype(rows)::value;
+            const int blocks_a=int((a->ne[0]+rows_per_block-1)/rows_per_block);
+            const int blocks_b=int((b->ne[0]+rows_per_block-1)/rows_per_block);
+            const ggml_cuda_kernel_launch_params params(dim3(blocks_a+blocks_b),dim3(32,4),0,ctx.stream());
+            ggml_cuda_kernel_launch(mul_mat_vec_q8_0_q8_1_rdna4_pair<decltype(tokens)::value,decltype(rows)::value>,params,
+                static_cast<const block_q8_0 *>(a->src[0]->data),static_cast<const block_q8_0 *>(b->src[0]->data),
+                reinterpret_cast<const block_q8_1 *>(q),static_cast<float *>(a->data),static_cast<float *>(b->data),
+                2048,int(a->ne[0]),int(b->ne[0]),blocks_a,2048/QK8_1);
+        };
+        const auto dispatch=[&](auto tokens) {
+            if(batch_row1) { launch(tokens,std::integral_constant<int,1>{}); } else { launch(tokens,std::integral_constant<int,2>{}); }
+        };
+        switch(n_tokens) {
+            case 2: dispatch(std::integral_constant<int,2>{}); break;
+            case 3: dispatch(std::integral_constant<int,3>{}); break;
+            case 4: dispatch(std::integral_constant<int,4>{}); break;
+            default: GGML_ABORT("unsupported Q8 pair batch");
+        }
+        return;
+    }
     if(!reuse) {
         quantize_row_q8_1_cuda(static_cast<const float *>(input->data),nullptr,q,GGML_TYPE_Q8_0,
             2048,2048,2048,2048,2048,1,1,1,ctx.stream());

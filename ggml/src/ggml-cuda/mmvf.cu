@@ -1051,8 +1051,17 @@ router_pair_f32(const float * x, const float * y, float * dst, int nrows,const f
 }
 void ggml_cuda_router_pair(ggml_backend_cuda_context &ctx,ggml_tensor *router,ggml_tensor *gate) {
     const ggml_cuda_kernel_launch_params params(dim3(257),dim3(128),0,ctx.stream());
-    ggml_cuda_kernel_launch(router_pair_f32<1>,params,
-        static_cast<const float *>(router->src[0]->data),static_cast<const float *>(router->src[1]->data),
-        static_cast<float *>(router->data),256,static_cast<const float *>(gate->src[0]->data),static_cast<float *>(gate->data));
+    const auto launch=[&](auto tokens) {
+        ggml_cuda_kernel_launch(router_pair_f32<decltype(tokens)::value>,params,
+            static_cast<const float *>(router->src[0]->data),static_cast<const float *>(router->src[1]->data),
+            static_cast<float *>(router->data),256,static_cast<const float *>(gate->src[0]->data),static_cast<float *>(gate->data));
+    };
+    switch(router->src[1]->ne[1]) {
+        case 1: launch(std::integral_constant<int,1>{}); break;
+        case 2: launch(std::integral_constant<int,2>{}); break;
+        case 3: launch(std::integral_constant<int,3>{}); break;
+        case 4: launch(std::integral_constant<int,4>{}); break;
+        default: GGML_ABORT("unsupported router batch");
+    }
 }
 #endif

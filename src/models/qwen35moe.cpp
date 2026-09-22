@@ -530,9 +530,21 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
 
     const char * early_env=std::getenv("LLAMA_MOE_EARLY_SHARED");
-    const int early=ubatch.n_tokens==1 && n_embd==2048 && early_env ? std::atoi(early_env) : 0;
+    // Small batches (speculative verification) too: with the early shared gate this keeps the shared expert
+    // gate/up, the router pair and the Q8_1 reuse adjacent. Scheduling only.
+    static const bool early_shared_batch=[] {
+        const char * value=std::getenv("LLAMA_MOE_EARLY_SHARED_BATCH");
+        return !value || std::atoi(value)!=0;
+    }();
+    const int early=(ubatch.n_tokens==1 || (early_shared_batch && ubatch.n_tokens<=4)) && n_embd==2048 && early_env ? std::atoi(early_env) : 0;
     const char *gate_env=std::getenv("LLAMA_MOE_EARLY_GATE");
-    const bool early_gate=gate_env && std::atoi(gate_env)!=0 && ubatch.n_tokens==1 && n_embd==2048;
+    // Small batches (speculative verification) too: puts the shared gate next to the router for the paired matvec.
+    static const bool early_gate_batch=[] {
+        const char * value=std::getenv("LLAMA_MOE_EARLY_GATE_BATCH");
+        return !value || std::atoi(value)!=0;
+    }();
+    const bool early_gate=gate_env && std::atoi(gate_env)!=0 &&
+        (ubatch.n_tokens==1 || (early_gate_batch && ubatch.n_tokens<=4)) && n_embd==2048;
     ggml_tensor *shared_gate_early=nullptr;
     auto build_routed=[&]() {
         if(early_gate && model.layers[il].ffn_gate_inp_shexp) {

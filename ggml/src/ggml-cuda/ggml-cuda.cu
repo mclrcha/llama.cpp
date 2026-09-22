@@ -4104,8 +4104,11 @@ static int ggml_cuda_try_router_pair(ggml_backend_cuda_context &ctx,ggml_cgraph 
     if(a->op!=GGML_OP_MUL_MAT || b->op!=GGML_OP_MUL_MAT || a->src[1]!=b->src[1]) { return 0; }
     auto *router=a->ne[0]==256 ? a : b;auto *gate=router==a ? b : a;
     const auto *x=a->src[1];
-    if(router->ne[0]!=256 || gate->ne[0]!=1 || ggml_nelements(router)!=256 || ggml_nelements(gate)!=1 ||
-            x->ne[0]!=2048 || ggml_nelements(x)!=2048 ||
+    // One token, or up to 4 (speculative verification).
+    const int64_t n_tokens=x->ne[1];
+    if(n_tokens<1 || n_tokens>4 || x->ne[2]!=1 || x->ne[3]!=1 ||
+            router->ne[0]!=256 || gate->ne[0]!=1 || ggml_nelements(router)!=256*n_tokens || ggml_nelements(gate)!=n_tokens ||
+            x->ne[0]!=2048 || ggml_nelements(x)!=2048*n_tokens ||
             router->src[0]->ne[0]!=2048 || ggml_nelements(router->src[0])!=2048*256 ||
             gate->src[0]->ne[0]!=2048 || ggml_nelements(gate->src[0])!=2048) { return 0; }
     const auto *wr=static_cast<const ggml_tensor *>(router->src[0]);

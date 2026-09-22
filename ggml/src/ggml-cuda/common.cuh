@@ -1469,26 +1469,89 @@ struct ggml_cuda_stream_context {
 };
 
 #if defined(GGML_USE_HIP)
+// Q8_1 copies of recent matrix-vector inputs. Two slots keep an activation that feeds several projections
+// (e.g. MoE shared expert and routed experts) while a smaller intermediate is quantized in between.
 struct ggml_hip_mmvq_cache {
-    static constexpr size_t capacity = 1 << 20;
-    void * data = nullptr;
-    const ggml_tensor * src = nullptr;
+    static constexpr size_t capacity = 1 << 20; // per slot
+    static constexpr int    nslots   = 2;
+    void * data = nullptr;                      // nslots*capacity bytes
+    const ggml_tensor * src[nslots] = {nullptr};
+    int last = 0;
     bool enabled = false;
 
+    char * slot(const int k) const {
+        return static_cast<char *>(data) + k*capacity;
+    }
+
+    // Views and reshapes of the same data share a Q8_1 copy; writes are tracked by address in invalidate_write.
+    static bool same_data(const ggml_tensor * a, const ggml_tensor * b) {
+        if (a == b) {
+            return true;
+        }
+        if (!a || !b || a->data != b->data || a->type != b->type) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (a->ne[d] != b->ne[d] || a->nb[d] != b->nb[d]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     char * acquire(const ggml_tensor * source, bool & reuse) {
-        reuse = src == source;
-        src = source;
-        return static_cast<char *>(data);
+        for (int k = 0; k < nslots; ++k) {
+            if (same_data(src[k], source)) {
+                reuse = true;
+                last  = k;
+                return slot(k);
+            }
+        }
+        reuse = false;
+        last = (last + 1) % nslots; // least recently used for two slots
+        src[last] = source;
+        return slot(last);
+    }
+
+    // A producer can write the Q8_1 copy of its own output: reserve a slot while computing the node and commit it
+    // after the graph loop has invalidated the slots that overlap the node's outputs.
+    const ggml_tensor * pending = nullptr;
+    int pending_slot = 0;
+
+    char * reserve(const ggml_tensor * source) {
+        last = (last + 1) % nslots;
+        src[last] = nullptr;
+        pending = source;
+        pending_slot = last;
+        return slot(last);
+    }
+
+    void commit() {
+        if (pending) {
+            src[pending_slot] = pending;
+            last = pending_slot;
+            pending = nullptr;
+        }
+    }
+
+    void reset() {
+        for (int k = 0; k < nslots; ++k) {
+            src[k] = nullptr;
+        }
+        last = 0;
+        pending = nullptr;
     }
 
     void invalidate_write(const ggml_tensor * dst) {
-        if (!src) {
-            return;
-        }
-        const uintptr_t a = reinterpret_cast<uintptr_t>(src->data);
         const uintptr_t b = reinterpret_cast<uintptr_t>(dst->data);
-        if (a < b + ggml_nbytes(dst) && b < a + ggml_nbytes(src)) {
-            src = nullptr;
+        for (int k = 0; k < nslots; ++k) {
+            if (!src[k]) {
+                continue;
+            }
+            const uintptr_t a = reinterpret_cast<uintptr_t>(src[k]->data);
+            if (a < b + ggml_nbytes(dst) && b < a + ggml_nbytes(src[k])) {
+                src[k] = nullptr;
+            }
         }
     }
 };

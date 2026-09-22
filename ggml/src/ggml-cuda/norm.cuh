@@ -29,7 +29,7 @@ void ggml_cuda_op_rms_norm_scale_pair_128(ggml_backend_cuda_context & ctx,
 #if defined(GGML_USE_HIP)
 void ggml_cuda_op_residual_rms(ggml_backend_cuda_context & ctx, ggml_tensor * add,
                              const ggml_tensor * norm, const ggml_tensor * weight, ggml_tensor * dst,
-                             const ggml_tensor * first, const ggml_tensor * gated_mul);
+                             const ggml_tensor * first, const ggml_tensor * gated_mul, void * quantized = nullptr);
 #endif
 
 #if defined(GGML_USE_HIP)

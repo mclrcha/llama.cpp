@@ -3780,7 +3780,16 @@ static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgra
                 (overlaps(dst, gated_mul->src[0]) && dst->data != gated_mul->src[0]->data)) { return 0; }
         }
     }
-    ggml_cuda_op_residual_rms(ctx, add, norm, weight, mul, first, gated_mul);
+    // Decode: write the Q8_1 copy of the normalized output for the following matrix-vector products.
+    static const bool quantize = [] {
+        const char * value = getenv("GGML_HIP_RESIDUAL_RMS_Q8");
+        return !value || std::atoi(value) != 0;
+    }();
+    void * quantized = nullptr;
+    if (quantize && size_t(add->ne[1])*(add->ne[0]/QK8_1)*sizeof(block_q8_1) <= ctx.mmvq_cache.capacity) {
+        quantized = ctx.mmvq_cache.reserve(mul);
+    }
+    ggml_cuda_op_residual_rms(ctx, add, norm, weight, mul, first, gated_mul, quantized);
     return 2+offset;
 }
 #endif
@@ -5171,6 +5180,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     for (int j = i; j <= i + nodes_to_skip; ++j) {
                         cuda_ctx->mmvq_cache.invalidate_write(cgraph->nodes[j]);
                     }
+                    cuda_ctx->mmvq_cache.commit();
 #endif
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -5275,12 +5285,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #if defined(GGML_USE_HIP)
     static const bool disable_mmvq_cache = getenv("GGML_HIP_DISABLE_MMVQ_CACHE") != nullptr;
     auto & cache = cuda_ctx->mmvq_cache;
-    cache.src = nullptr;
+    cache.reset();
     cache.enabled = !disable_mmvq_cache && cuda_ctx->stream_context().concurrent_events.empty() &&
                     GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[cuda_ctx->device].cc);
     // The address remains stable for every captured graph on this context.
     if (cache.enabled && !cache.data) {
-        CUDA_CHECK(cudaMalloc(&cache.data, cache.capacity));
+        CUDA_CHECK(cudaMalloc(&cache.data, cache.nslots*cache.capacity));
     }
 #endif
 
@@ -5344,7 +5354,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 #if defined(GGML_USE_HIP)
-    cache.src = nullptr;
+    cache.reset();
     cache.enabled = false;
 #endif
 

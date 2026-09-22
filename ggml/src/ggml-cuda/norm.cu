@@ -771,9 +771,10 @@ void ggml_cuda_op_rms_norm_scale_pair_128(ggml_backend_cuda_context & ctx,
 #endif
 
 #if defined(GGML_USE_HIP)
-template<int width, bool chain, bool gated>
+template<int width, bool chain, bool gated, bool quantize>
 static __global__ void residual_rms_f32(const float * a, const float * b, const float * weight,
-                                      float * residual, float * normalized, float eps, const float * c, const float * gate) {
+                                      float * residual, float * normalized, float eps, const float * c, const float * gate,
+                                      block_q8_1 * quantized) {
     const int tid = threadIdx.x, base = blockIdx.x * width;
     float values[width/1024];
     float sum = 0.0f;
@@ -798,22 +799,45 @@ static __global__ void residual_rms_f32(const float * a, const float * b, const 
     for (int j = 0; j < width/1024; ++j) {
         const int col = tid + j*1024;
         residual[base+col] = values[j];
-        normalized[base+col] = scale * values[j] * weight[col];
+        float value;
+        {
+#pragma clang fp contract(off)
+            // Keep the product rounded: otherwise it can contract into the first addition of the Q8_1 sum below.
+            value = scale * values[j] * weight[col];
+        }
+        normalized[base+col] = value;
+        if constexpr (quantize) {
+            // Same lane mapping and reductions as quantize_q8_1: each warp holds one block of 32 values.
+            const float amax = warp_reduce_max<QK8_1>(fabsf(value));
+            const float sum  = warp_reduce_sum<QK8_1>(value);
+            const float d = amax / 127.0f;
+            const int8_t q = amax == 0.0f ? 0 : roundf(value / d);
+            const int ib = (base + col) / QK8_1;
+            quantized[ib].qs[col % QK8_1] = q;
+            if (col % QK8_1 == 0) {
+                quantized[ib].ds = make_half2(d, sum);
+            }
+        }
     }
 }
 
 void ggml_cuda_op_residual_rms(ggml_backend_cuda_context & ctx, ggml_tensor * add,
                              const ggml_tensor * norm, const ggml_tensor * weight, ggml_tensor * dst,
-                             const ggml_tensor * first, const ggml_tensor * gated_mul) {
+                             const ggml_tensor * first, const ggml_tensor * gated_mul, void * quantized) {
     float eps; memcpy(&eps, norm->op_params, sizeof(float));
     const ggml_cuda_kernel_launch_params params(dim3(add->ne[1]), dim3(1024), 32*sizeof(float), ctx.stream());
     const auto * input = first ? first : add;
-    const auto launch = [&](auto width, auto chain, auto gated) {
-        ggml_cuda_kernel_launch(residual_rms_f32<decltype(width)::value, decltype(chain)::value, decltype(gated)::value>, params,
+    const auto launch_q = [&](auto width, auto chain, auto gated, auto q8) {
+        ggml_cuda_kernel_launch(residual_rms_f32<decltype(width)::value, decltype(chain)::value, decltype(gated)::value, decltype(q8)::value>, params,
             static_cast<const float *>(input->src[0]->data), static_cast<const float *>((gated_mul ? gated_mul->src[0] : input->src[1])->data),
             static_cast<const float *>(weight->data), static_cast<float *>(add->data), static_cast<float *>(dst->data), eps,
             first ? static_cast<const float *>(add->src[1]->data) : nullptr,
-            gated_mul ? static_cast<const float *>(gated_mul->src[1]->src[0]->data) : nullptr);
+            gated_mul ? static_cast<const float *>(gated_mul->src[1]->src[0]->data) : nullptr,
+            static_cast<block_q8_1 *>(quantized));
+    };
+    const auto launch = [&](auto width, auto chain, auto gated) {
+        if (quantized) { launch_q(width, chain, gated, std::true_type{}); }
+        else { launch_q(width, chain, gated, std::false_type{}); }
     };
     const auto launch_width = [&](auto width) {
         if (gated_mul) { launch(width, std::true_type{}, std::true_type{}); }

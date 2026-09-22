@@ -1500,6 +1500,10 @@ struct ggml_hip_mmvq_cache {
         if (!a || !b || a->data != b->data || a->type != b->type) {
             return false;
         }
+        // The Q8_1 layout of a contiguous tensor only depends on the row length and the number of rows.
+        if (a->ne[0] == b->ne[0] && ggml_nelements(a) == ggml_nelements(b) && ggml_is_contiguous(a) && ggml_is_contiguous(b)) {
+            return true;
+        }
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             if (a->ne[d] != b->ne[d] || a->nb[d] != b->nb[d]) {
                 return false;

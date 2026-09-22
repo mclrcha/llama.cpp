@@ -1836,7 +1836,7 @@ void ggml_cuda_mul_mat_vec_q(
     if (q8_out && fusion && fusion->gate && cache.enabled && ctx.curr_stream_no == 0 &&
             GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc) &&
             (ids ? dst->ne[2] == 1 : dst->ne[1] == 1) && dst->ne[3] == 1 && ggml_is_contiguous(dst) &&
-            dst->ne[0] % QK8_1 == 0 && ggml_nelements(dst)/QK8_1 <= cache.ncounters &&
+            dst->ne[0] % MATRIX_ROW_PADDING == 0 && ggml_nelements(dst)/QK8_1 <= cache.ncounters &&
             size_t(ggml_nelements(dst)/QK8_1)*sizeof(block_q8_1) <= cache.capacity) {
         fusion_local.q8_out      = cache.reserve(dst);
         fusion_local.q8_counters = cache.counters();

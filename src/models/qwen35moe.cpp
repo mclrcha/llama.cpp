@@ -389,7 +389,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     const char * early_z_env = std::getenv("LLAMA_GDN_EARLY_Z");
     const int early_z = early_z_env ? std::atoi(early_z_env) : 0;
-    if (early_z > 0 && ubatch.n_tokens == 1 && n_embd == 2048) {
+    // Small batches (speculative verification) too: keeps the output norm, gate and Q8_1 quantization adjacent.
+    static const bool early_z_batch = [] {
+        const char * value = std::getenv("LLAMA_GDN_EARLY_Z_BATCH");
+        return !value || std::atoi(value) != 0;
+    }();
+    if (early_z > 0 && (ubatch.n_tokens == 1 || (early_z_batch && ubatch.n_tokens <= 4)) && n_embd == 2048) {
         // Schedule independent projections before recurrent state work.
         if (early_z == 2) {
             ggml_build_forward_expand(gf, qkv_mixed);

@@ -1511,6 +1511,31 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_draft_lm_head(
+          ggml_tensor * w,
+          ggml_tensor * cur,
+          ggml_tensor * w_s) const {
+    static const int64_t draft_vocab = [] {
+        // 98304 keeps the MTP acceptance of Qwen3.6/3.8 (248320 tokens, BPE ids roughly by frequency) nearly unchanged
+        // while reading 40% of the LM head per draft token. 0 uses the full vocabulary.
+        const char * value = getenv("LLAMA_MTP_DRAFT_VOCAB");
+        return value ? (int64_t) std::atoll(value) : (int64_t) 98304;
+    }();
+    const int64_t n_vocab_w = w->ne[1];
+    if (draft_vocab < 16 || draft_vocab >= n_vocab_w || w_s != nullptr || !loras->empty() || cur->ne[1] < 1 ||
+            cur->ne[2] != 1 || cur->ne[3] != 1) {
+        return build_lora_mm(w, cur, w_s);
+    }
+    ggml_tensor * w_sub  = ggml_view_2d(ctx0, w, w->ne[0], draft_vocab, w->nb[1], 0);
+    ggml_tensor * logits = ggml_mul_mat(ctx0, w_sub, cur);
+
+    ggml_tensor * rest = ggml_arange(ctx0, 0.0f, (float) (n_vocab_w - draft_vocab), 1.0f);
+    rest = ggml_scale_bias(ctx0, rest, 0.0f, -INFINITY);
+    rest = ggml_repeat_4d(ctx0, rest, n_vocab_w - draft_vocab, cur->ne[1], 1, 1);
+
+    return ggml_concat(ctx0, logits, rest, 0);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,

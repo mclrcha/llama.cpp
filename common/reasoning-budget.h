@@ -50,3 +50,6 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);
+
+// true while the sampler replaces the logits with a forced token (i.e. its apply() is not a passthrough)
+bool common_reasoning_budget_is_forcing(const struct llama_sampler * smpl);

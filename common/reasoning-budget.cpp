@@ -288,6 +288,14 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
     return &ctx->end_matcher.seqs[ctx->end_match];
 }
 
+bool common_reasoning_budget_is_forcing(const struct llama_sampler * smpl) {
+    if (!smpl) {
+        return false;
+    }
+    const auto * ctx = (const common_reasoning_budget_ctx *) smpl->ctx;
+    return ctx->state == REASONING_BUDGET_FORCING && ctx->force_pos < ctx->forced_tokens.size();
+}
+
 bool common_reasoning_budget_force(struct llama_sampler * smpl) {
     if (!smpl) {
         return false;

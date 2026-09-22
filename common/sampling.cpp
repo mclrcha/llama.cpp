@@ -591,6 +591,164 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// Exact shortcut for the common chain "(neutral samplers) -> top-k -> ...": instead of building the full candidate
+// array (n_vocab entries), keep only the tokens that can be in the top-k. The chain then runs unchanged on them.
+// The top-k of the full array is unique when the k+1 best logits are distinct; otherwise fall back.
+static bool common_sampler_fast_candidates(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+    static const bool enabled = [] {
+        const char * value = getenv("LLAMA_SAMPLER_FAST_TOPK");
+        return !value || atoi(value) != 0;
+    }();
+    const auto & p = gsmpl->params;
+    if (!enabled || gsmpl->grmr || p.mirostat != 0 || p.top_k <= 0 || p.top_k > 256) {
+        return false;
+    }
+    // -inf biases (e.g. EOG tokens with ignore_eos) only remove tokens; finite biases change the ranking
+    for (const auto & lb : p.logit_bias) {
+        if (!(std::isinf(lb.bias) && lb.bias < 0.0f)) {
+            return false;
+        }
+    }
+    if (gsmpl->rbudget && common_reasoning_budget_is_forcing(gsmpl->rbudget)) {
+        return false;
+    }
+    bool has_top_k = false;
+    for (const auto s : p.samplers) {
+        if (s == COMMON_SAMPLER_TYPE_TOP_K) {
+            has_top_k = true;
+            break;
+        }
+        switch (s) {
+            case COMMON_SAMPLER_TYPE_PENALTIES:
+                if (!(p.penalty_last_n == 0 || (p.penalty_repeat == 1.0f && p.penalty_freq == 0.0f && p.penalty_present == 0.0f))) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_DRY:
+                if (p.dry_multiplier != 0.0f && p.dry_base >= 1.0f && p.dry_penalty_last_n != 0) {
+                    return false;
+                }
+                break;
+            case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                if (p.top_n_sigma > 0.0f) {
+                    return false;
+                }
+                break;
+            default:
+                return false;
+        }
+    }
+    if (!has_top_k || llama_get_sampled_probs_ith(ctx, idx) || llama_get_sampled_logits_ith(ctx, idx) ||
+            llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
+        return false;
+    }
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (!logits) {
+        return false;
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const int n_vocab = llama_vocab_n_tokens(vocab);
+    const int k = std::min<int>(p.top_k, n_vocab);
+
+    // tokens suppressed by the model get -inf from the logit bias sampler: exclude them
+    int32_t n_suppress = 0;
+    const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+    std::vector<llama_token> suppressed(suppress, suppress + n_suppress);
+    for (const auto & lb : p.logit_bias) {
+        suppressed.push_back(lb.token);
+    }
+    std::sort(suppressed.begin(), suppressed.end());
+    const auto is_suppressed = [&](llama_token id) {
+        return !suppressed.empty() && std::binary_search(suppressed.begin(), suppressed.end(), id);
+    };
+
+    // the k-th largest block maximum is a lower bound of the k-th largest logit
+    constexpr int block = 256;
+    const int n_blocks = (n_vocab + block - 1) / block;
+    if (n_blocks < k) {
+        return false;
+    }
+    static thread_local std::vector<float> maxima, order;
+    maxima.resize(n_blocks);
+    for (int b = 0; b < n_blocks; ++b) {
+        const int i0 = b*block, i1 = std::min(n_vocab, i0 + block);
+        float m = -INFINITY;
+        if (i1 - i0 == block) {
+            // independent lanes with an explicit select vectorize without changing the result
+            float lane[16];
+            for (int j = 0; j < 16; ++j) {
+                lane[j] = -INFINITY;
+            }
+            for (int i = i0; i < i1; i += 16) {
+                for (int j = 0; j < 16; ++j) {
+                    lane[j] = logits[i + j] > lane[j] ? logits[i + j] : lane[j];
+                }
+            }
+            for (int j = 0; j < 16; ++j) {
+                m = lane[j] > m ? lane[j] : m;
+            }
+        } else {
+            for (int i = i0; i < i1; ++i) {
+                m = logits[i] > m ? logits[i] : m;
+            }
+        }
+        maxima[b] = m;
+    }
+    for (const llama_token id : suppressed) {
+        if (id < 0 || id >= n_vocab) {
+            continue;
+        }
+        const int b = id / block, i0 = b*block, i1 = std::min(n_vocab, i0 + block);
+        float m = -INFINITY;
+        for (int i = i0; i < i1; ++i) {
+            if (!is_suppressed(i)) {
+                m = std::max(m, logits[i]);
+            }
+        }
+        maxima[b] = m;
+    }
+    order = maxima;
+    std::nth_element(order.begin(), order.begin() + (k - 1), order.end(), std::greater<float>());
+    const float threshold = order[k - 1];
+    if (!std::isfinite(threshold)) {
+        return false;
+    }
+
+    // only blocks whose maximum reaches the threshold can hold candidates
+    auto & cur = gsmpl->cur;
+    cur.clear();
+    for (int b = 0; b < n_blocks; ++b) {
+        if (!(maxima[b] >= threshold)) {
+            continue;
+        }
+        const int i0 = b*block, i1 = std::min(n_vocab, i0 + block);
+        for (int i = i0; i < i1; ++i) {
+            if (logits[i] >= threshold && !is_suppressed(i)) {
+                cur.push_back(llama_token_data{i, logits[i], 0.0f});
+            }
+        }
+    }
+    if ((int) cur.size() < k) {
+        return false;
+    }
+
+    // uniqueness of the top-k (and of its order): the k+1 best logits must be distinct
+    const int n_check = std::min<int>(k + 1, cur.size());
+    std::vector<float> best(cur.size());
+    for (size_t i = 0; i < cur.size(); ++i) {
+        best[i] = cur[i].logit;
+    }
+    std::partial_sort(best.begin(), best.begin() + n_check, best.end(), std::greater<float>());
+    for (int i = 1; i < n_check; ++i) {
+        if (!(best[i-1] > best[i])) {
+            return false;
+        }
+    }
+
+    gsmpl->cur_p = { cur.data(), cur.size(), -1, false };
+    return true;
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     llama_synchronize(ctx);
 
@@ -604,7 +762,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    gsmpl->set_logits(ctx, idx);
+    if (!common_sampler_fast_candidates(gsmpl, ctx, idx)) {
+        gsmpl->set_logits(ctx, idx);
+    }
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.

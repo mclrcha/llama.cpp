@@ -207,6 +207,38 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
 
 #if defined(GGML_USE_HIP)
 struct conv_qk_args { float *q,*k;int heads;float eps,scale,bias; };
+// Several tokens (speculative verification): same arithmetic as ssm_conv + silu for each token.
+// The saved states are windows starting after `keep` tokens (speculative decoding keeps one per accepted length).
+template<bool indexed,int n_tokens>
+static __global__ void conv_prepare_silu_batch_f32(const float * old_state,const float * input,
+        const float * weight,float * output,const int32_t * index,int64_t stride,int channels,ggml_cuda_conv_states states) {
+    if constexpr(indexed) { old_state+=int64_t(*index)*stride; }
+    const int c=blockIdx.x*128+threadIdx.x;
+    float x[3+n_tokens];
+    x[0]=old_state[3*c];x[1]=old_state[3*c+1];x[2]=old_state[3*c+2];
+#pragma unroll
+    for(int t=0;t<n_tokens;++t) { x[3+t]=input[int64_t(t)*channels+c]; }
+    const float w0=weight[4*c],w1=weight[4*c+1],w2=weight[4*c+2],w3=weight[4*c+3];
+#pragma unroll
+    for(int t=0;t<n_tokens;++t) {
+        float sum=0.0f;
+        sum=fmaf(x[t],w0,sum);
+        sum=fmaf(x[t+1],w1,sum);
+        sum=fmaf(x[t+2],w2,sum);
+        sum=fmaf(x[t+3],w3,sum);
+        sum+=0.0f;
+        output[int64_t(t)*channels+c]=ggml_cuda_op_silu_single(sum);
+    }
+    for(int i=0;i<states.n;++i) {
+        const int keep=states.keep[i];
+        float * next_state=states.dst[i];
+#pragma unroll
+        for(int k=0;k<=n_tokens;++k) {
+            if(k==keep) { next_state[3*c]=x[k];next_state[3*c+1]=x[k+1];next_state[3*c+2]=x[k+2]; }
+        }
+    }
+}
+
 template<bool indexed,bool normalize>
 static __global__ void conv_prepare_silu_f32(const float * old_state,const float * input,
         const float * weight,float * next_state,float * output,const int32_t * index,int64_t stride,conv_qk_args qk) {
@@ -244,7 +276,30 @@ static __global__ void conv_prepare_silu_f32(const float * old_state,const float
 
 void ggml_cuda_op_conv_prepare(ggml_backend_cuda_context & ctx,const ggml_tensor * concat,
         const ggml_tensor * weight,const ggml_tensor * state,ggml_tensor * output,const ggml_tensor * gathered,
-        const ggml_tensor *norm,ggml_tensor *q,ggml_tensor *k) {
+        const ggml_tensor *norm,ggml_tensor *q,ggml_tensor *k,const ggml_cuda_conv_states * states) {
+    const int n_tokens=int(concat->ne[0])-3;
+    if(n_tokens>1) {
+        GGML_ASSERT(!norm && states && states->n>=1 && states->n<=8);
+        const ggml_cuda_kernel_launch_params params(dim3(concat->ne[1]/128),dim3(128),0,ctx.stream());
+        const auto launch=[&](auto flag,auto tokens) {
+            ggml_cuda_kernel_launch(conv_prepare_silu_batch_f32<decltype(flag)::value,decltype(tokens)::value>,params,
+                static_cast<const float *>(gathered ? gathered->src[0]->data : concat->src[0]->data),
+                static_cast<const float *>(concat->src[1]->data),static_cast<const float *>(weight->data),
+                static_cast<float *>(output->data),
+                gathered ? static_cast<const int32_t *>(gathered->src[1]->data) : nullptr,
+                gathered ? int64_t(gathered->src[0]->nb[1]/sizeof(float)) : 0,int(concat->ne[1]),*states);
+        };
+        const auto dispatch=[&](auto flag) {
+            switch(n_tokens) {
+                case 2: launch(flag,std::integral_constant<int,2>{}); break;
+                case 3: launch(flag,std::integral_constant<int,3>{}); break;
+                case 4: launch(flag,std::integral_constant<int,4>{}); break;
+                default: GGML_ABORT("unsupported conv batch");
+            }
+        };
+        if(gathered) { dispatch(std::true_type{}); } else { dispatch(std::false_type{}); }
+        return;
+    }
     conv_qk_args qk{};
     if(norm) { qk={static_cast<float *>(q->data),static_cast<float *>(k->data),int(norm->ne[1]),
         ggml_get_op_params_f32(norm,0),ggml_get_op_params_f32(q,0),ggml_get_op_params_f32(q,1)}; }

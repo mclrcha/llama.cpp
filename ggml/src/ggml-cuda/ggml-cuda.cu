@@ -3943,62 +3943,111 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
     }
     auto * concat=graph->nodes[i];
     if (concat->op!=GGML_OP_CONCAT || ggml_get_op_params_i32(concat,0)!=0 ||
-            concat->ne[0]!=4 || concat->ne[1]%128!=0 || concat->ne[2]!=1 || concat->ne[3]!=1) { return 0; }
+            concat->ne[0]<4 || concat->ne[0]>7 || concat->ne[1]%128!=0 || concat->ne[2]!=1 || concat->ne[3]!=1) { return 0; }
     const auto * old=concat->src[0];const auto * input=concat->src[1];
-    if (old->ne[0]!=3 || input->ne[0]!=1 || input->nb[1]!=sizeof(float) ||
-            !ggml_is_contiguous(old) || !ggml_is_contiguous(input)) { return 0; }
+    // One token: contiguous column. Up to 4 tokens (speculative verification): transposed view of [C, N] projections.
+    const int n_tokens=int(concat->ne[0])-3;
+    if (old->ne[0]!=3 || input->ne[0]!=n_tokens || input->nb[1]!=sizeof(float) || !ggml_is_contiguous(old) ||
+            (n_tokens==1 ? !ggml_is_contiguous(input) : input->nb[0]!=size_t(concat->ne[1])*sizeof(float))) { return 0; }
     if(gathered && (old->view_src!=gathered || gathered->ne[0]!=3*concat->ne[1])) { return 0; }
     indices.push_back(i);ops.push_back(GGML_OP_CONCAT);
-    int copy_idx=-1,conv_idx=-1;
+    int conv_idx=-1;
+    std::vector<int> copies;                 // conv state writes; speculative decoding keeps one per accepted length
+    std::vector<ggml_tensor *> independent;  // nodes between the state copies and the convolution (recurrent state gather)
     for(int j=i+1;j<graph->n_nodes && j<i+24;++j) {
         auto *t=graph->nodes[j];
         if(ggml_cuda_is_view_or_noop(t)) {
             if(t->view_src==concat) { indices.push_back(j);ops.push_back(t->op); }
             continue;
         }
-        if(t->op==GGML_OP_CPY && copy_idx==-1 && t->src[0]->view_src==concat) {
-            copy_idx=j;indices.push_back(j);ops.push_back(t->op);continue;
+        if(t->op==GGML_OP_CPY && t->src[0]->view_src==concat && independent.empty() &&
+                (copies.empty() || n_tokens>1) && copies.size()<8) {
+            copies.push_back(j);indices.push_back(j);ops.push_back(t->op);continue;
         }
-        if(t->op==GGML_OP_SSM_CONV && copy_idx!=-1 && t->src[0]==concat) { conv_idx=j; }
+        if(t->op==GGML_OP_SSM_CONV && !copies.empty() && t->src[0]==concat) { conv_idx=j;break; }
+        if(n_tokens>1 && !copies.empty() && independent.size()<4 && (t->op==GGML_OP_GET_ROWS || t->op==GGML_OP_CPY || t->op==GGML_OP_SCALE)) {
+            independent.push_back(t);continue;
+        }
         break;
     }
     if(conv_idx==-1 || conv_idx+1>=graph->n_nodes) { return 0; }
     auto *conv=graph->nodes[conv_idx];auto *silu=graph->nodes[conv_idx+1];
-    auto *copy=graph->nodes[copy_idx];const auto *state=copy->src[1];const auto *weight=conv->src[1];
+    const auto *weight=conv->src[1];
     if(silu->op!=GGML_OP_UNARY || ggml_get_unary_op(silu)!=GGML_UNARY_OP_SILU || silu->src[0]!=conv ||
-            copy->src[0]->view_offs!=sizeof(float) || copy->src[0]->ne[0]!=3 ||
-            copy->src[0]->ne[1]!=concat->ne[1] || copy->src[0]->ne[2]!=1 || copy->src[0]->ne[3]!=1 ||
-            copy->src[0]->nb[0]!=sizeof(float) || copy->src[0]->nb[1]!=4*sizeof(float) ||
-            ggml_nelements(state)!=3*concat->ne[1] || ggml_nelements(silu)!=concat->ne[1] ||
+            ggml_nelements(silu)!=n_tokens*concat->ne[1] ||
             weight->ne[0]!=4 || weight->ne[1]!=concat->ne[1] || weight->ne[2]!=1 || weight->ne[3]!=1) { return 0; }
-    for(const ggml_tensor *t:{old,input,weight,state,static_cast<const ggml_tensor *>(concat),static_cast<const ggml_tensor *>(conv),static_cast<const ggml_tensor *>(silu)}) {
+    std::vector<const ggml_tensor *> states;
+    for(const int j:copies) {
+        const auto *copy=graph->nodes[j];const auto *window=copy->src[0];
+        if(window->view_offs%sizeof(float)!=0 || window->view_offs>n_tokens*sizeof(float) ||
+                (n_tokens==1 && window->view_offs!=sizeof(float)) || window->ne[0]!=3 ||
+                window->ne[1]!=concat->ne[1] || window->ne[2]!=1 || window->ne[3]!=1 ||
+                window->nb[0]!=sizeof(float) || window->nb[1]!=size_t(3+n_tokens)*sizeof(float) ||
+                ggml_nelements(copy->src[1])!=3*concat->ne[1]) { return 0; }
+        states.push_back(copy->src[1]);
+    }
+    const auto *state=states[0];
+    for(const ggml_tensor *t:{old,input,weight,static_cast<const ggml_tensor *>(concat),static_cast<const ggml_tensor *>(conv),static_cast<const ggml_tensor *>(silu)}) {
+        if(t->type!=GGML_TYPE_F32 || (t!=input && !ggml_is_contiguous(t)) || !t->buffer ||
+                t->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
+    }
+    for(const auto *t:states) {
         if(t->type!=GGML_TYPE_F32 || !ggml_is_contiguous(t) || !t->buffer ||
                 t->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
     }
     indices.push_back(conv_idx);ops.push_back(GGML_OP_SSM_CONV);
     indices.push_back(conv_idx+1);ops.push_back(GGML_OP_UNARY);
-    const int outputs[]={copy_idx,conv_idx+1};
-    if(!ggml_can_fuse_subgraph_ext(graph,indices.data(),indices.size(),ops.data(),outputs,2)) { return 0; }
+    std::vector<int> outputs(copies);outputs.push_back(conv_idx+1);
+    if(!ggml_can_fuse_subgraph_ext(graph,indices.data(),indices.size(),ops.data(),outputs.data(),int(outputs.size()))) { return 0; }
     const auto overlaps=[](const ggml_tensor *a,const ggml_tensor *b) {
         const uintptr_t x=reinterpret_cast<uintptr_t>(a->data),y=reinterpret_cast<uintptr_t>(b->data);
         return x<y+ggml_nbytes(b) && y<x+ggml_nbytes(a);
     };
     const auto * source=gathered ? gathered->src[0] : old;
-    if(overlaps(state,silu) || overlaps(state,input) || overlaps(state,weight) ||
-            overlaps(silu,source) || overlaps(silu,weight) || (overlaps(silu,input) && silu->data!=input->data) ||
-            overlaps(concat,weight) || overlaps(copy,weight)) { return 0; }
+    if(overlaps(silu,source) || overlaps(silu,weight) || (overlaps(silu,input) && silu->data!=input->data) ||
+            overlaps(concat,weight)) { return 0; }
     if(gathered) {
         for(const auto *t:{gathered->src[0],gathered->src[1]}) {
             if(!t->buffer || t->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
         }
-        const size_t bytes=3*concat->ne[1]*sizeof(float);
-        if((overlaps(state,source) && (reinterpret_cast<uintptr_t>(state->data)-reinterpret_cast<uintptr_t>(source->data))%bytes!=0) ||
-                overlaps(state,gathered->src[1]) || overlaps(silu,gathered->src[1])) { return 0; }
-    } else if(overlaps(state,old)) { return 0; }
+        if(overlaps(silu,gathered->src[1])) { return 0; }
+    }
+    const size_t state_bytes=3*concat->ne[1]*sizeof(float);
+    for(size_t a=0;a<states.size();++a) {
+        const auto *st=states[a];
+        if(overlaps(st,silu) || overlaps(st,input) || overlaps(st,weight)) { return 0; }
+        for(size_t b=a+1;b<states.size();++b) {
+            if(overlaps(st,states[b])) { return 0; }
+        }
+        // Each channel reads its old values before writing: a destination may alias the source row, not straddle it.
+        if(gathered) {
+            if((overlaps(st,source) && (reinterpret_cast<uintptr_t>(st->data)-reinterpret_cast<uintptr_t>(source->data))%state_bytes!=0) ||
+                    overlaps(st,gathered->src[1])) { return 0; }
+        } else if(overlaps(st,old) && (states.size()>1 || st->data!=old->data)) { return 0; }
+    }
+    // Nodes skipped over must not touch the convolution data; they run first, in graph order.
+    // Their outputs must not alias anything the fusion reads or writes; their inputs must not alias the fused outputs.
+    for(const auto *t:independent) {
+        for(const ggml_tensor *v:{source,input,weight,static_cast<const ggml_tensor *>(concat),static_cast<const ggml_tensor *>(silu)}) {
+            if(overlaps(t,v)) { return 0; }
+        }
+        if(gathered && overlaps(t,gathered->src[1])) { return 0; }
+        for(const auto *st:states) {
+            if(overlaps(t,st)) { return 0; }
+        }
+        for(const ggml_tensor *u:{t->src[0],t->src[1]}) {
+            // concat is never materialized by the fusion
+            if(!u) { continue; }
+            if(overlaps(u,silu) || overlaps(u,concat) || u->view_src==concat) { return 0; }
+            for(const auto *st:states) {
+                if(overlaps(u,st)) { return 0; }
+            }
+        }
+    }
     const ggml_tensor *qnorm=nullptr;
     ggml_tensor *qout=nullptr,*kout=nullptr;
     int last=conv_idx+1;
-    if(mode>=2 && conv_idx+7<graph->n_nodes) {
+    if(n_tokens==1 && mode>=2 && conv_idx+7<graph->n_nodes) {
         auto *qview=graph->nodes[conv_idx+2];auto *qn=graph->nodes[conv_idx+3];auto *qs=graph->nodes[conv_idx+4];
         auto *kview=graph->nodes[conv_idx+5];auto *kn=graph->nodes[conv_idx+6];auto *ks=graph->nodes[conv_idx+7];
         bool valid=qview->op==GGML_OP_VIEW && qview->view_src==silu && qview->view_offs==0 &&
@@ -4024,13 +4073,24 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
         if(valid) {
             auto qk_indices=indices;auto qk_ops=ops;
             for(int j=conv_idx+2;j<=conv_idx+7;++j) { qk_indices.push_back(j);qk_ops.push_back(graph->nodes[j]->op); }
-            const int qk_outputs[]={copy_idx,conv_idx+1,conv_idx+4,conv_idx+7};
+            const int qk_outputs[]={copies[0],conv_idx+1,conv_idx+4,conv_idx+7};
             if(ggml_can_fuse_subgraph_ext(graph,qk_indices.data(),qk_indices.size(),qk_ops.data(),qk_outputs,4)) {
                 qnorm=qn;qout=qs;kout=ks;last=conv_idx+7;
             }
         }
     }
-    ggml_cuda_op_conv_prepare(ctx,concat,weight,state,silu,gathered,qnorm,qout,kout);
+    for(auto *t:independent) {
+        if(!ggml_is_empty(t) && (t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            GGML_ASSERT(ggml_cuda_compute_forward(ctx,t));
+        }
+    }
+    ggml_cuda_conv_states conv_states{};
+    conv_states.n=int(copies.size());
+    for(size_t c=0;c<copies.size();++c) {
+        conv_states.dst[c]=static_cast<float *>(graph->nodes[copies[c]]->src[1]->data);
+        conv_states.keep[c]=int(graph->nodes[copies[c]]->src[0]->view_offs/sizeof(float));
+    }
+    ggml_cuda_op_conv_prepare(ctx,concat,weight,state,silu,gathered,qnorm,qout,kout,&conv_states);
     return last-first;
 }
 #endif

@@ -594,13 +594,14 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
 // Exact shortcut for the common chain "(neutral samplers) -> top-k -> ...": instead of building the full candidate
 // array (n_vocab entries), keep only the tokens that can be in the top-k. The chain then runs unchanged on them.
 // The top-k of the full array is unique when the k+1 best logits are distinct; otherwise fall back.
-static bool common_sampler_fast_candidates(struct common_sampler * gsmpl, struct llama_context * ctx, int idx) {
+static bool common_sampler_fast_candidates(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
     static const bool enabled = [] {
         const char * value = getenv("LLAMA_SAMPLER_FAST_TOPK");
         return !value || atoi(value) != 0;
     }();
     const auto & p = gsmpl->params;
-    if (!enabled || gsmpl->grmr || p.mirostat != 0 || p.top_k <= 0 || p.top_k > 256) {
+    // A grammar applied after sampling only checks the sampled token (and resamples from the full array if rejected).
+    if (!enabled || (grammar_first && grammar_should_apply(gsmpl)) || p.mirostat != 0 || p.top_k <= 0 || p.top_k > 256) {
         return false;
     }
     // -inf biases (e.g. EOG tokens with ignore_eos) only remove tokens; finite biases change the ranking
@@ -762,7 +763,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & chain = gsmpl->chain;
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
-    if (!common_sampler_fast_candidates(gsmpl, ctx, idx)) {
+    if (!common_sampler_fast_candidates(gsmpl, ctx, idx, grammar_first)) {
         gsmpl->set_logits(ctx, idx);
     }
 

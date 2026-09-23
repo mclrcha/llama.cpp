@@ -1389,7 +1389,11 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+    // RDNA4 q8_1 vec_dot keeps the block sums of the first y half after the x tile.
+    const bool q8_1_dot = config.type == GGML_TYPE_Q4_1 || config.type == GGML_TYPE_Q5_1 || config.type == GGML_TYPE_Q4_K ||
+        config.type == GGML_TYPE_Q5_K || config.type == GGML_TYPE_IQ1_S;
+    const size_t nbs_s = GGML_CUDA_CC_IS_RDNA4(cc) && config.use_mma_data_layout(cc) && q8_1_dot ? config.J*2*sizeof(half2) : 0;
+    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int)) + nbs_s;
 }
 
 template <ggml_type type, int J, bool fallback>

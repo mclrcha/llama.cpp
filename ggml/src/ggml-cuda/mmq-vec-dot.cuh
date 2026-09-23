@@ -312,7 +312,116 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
-#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    // R9700: the inner loop only adds dA*dB*C. The min term, sum over blocks of mA*sB, is a small matrix product:
+    // one f16 WMMA per C tile and per x tile over its 8 blocks (exact f16 products, f32 accumulation).
+    // The first call keeps sB of its 4 blocks in SRAM after the x tile, the second call does the WMMA.
+    typedef tile<16,  8, int,   DATA_LAYOUT_I_MAJOR> tile_A;
+    typedef tile<16,  8, int,   DATA_LAYOUT_I_MAJOR> tile_B;
+    typedef tile<16, 16, int,   DATA_LAYOUT_J_MAJOR> tile_C;
+    typedef tile<16,  8, half2, DATA_LAYOUT_I_MAJOR> tile_M;
+    typedef tile<16, 16, float, DATA_LAYOUT_J_MAJOR> tile_S;
+
+    constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
+    constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    static_assert(MMQ_TILE_NE_K/QI8_1 == 4, "bad number of blocks");
+
+    const int jw = (threadIdx.y % ntx) * tile_C::J; // Column offset of this warp.
+    y += jw*MMQ_TILE_Y_K;
+
+    const int   * x_qs = (const int   *) x;
+    const half2 * x_dm = (const half2 *) x_qs + 2*MMQ_TILE_NE_K;
+    const int   * y_qs = (const int   *) y + 4;
+    const half2 * y_dm = (const half2 *) y;
+    half2       * s_sB = (half2 *) (x_qs + I*sram_stride); // 2 half2 per column: sB of blocks 0..3.
+
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
+        const int k0 = k00 + k01;
+
+        tile_A A[ntx];
+        float  dA[ntx][tile_C::ne];
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+#pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                dA[n][l] = __low2float(x_dm[(i0 + n*tile_A::I + tile_C::get_i(l))*sram_stride + k0/QI8_1]);
+            }
+        }
+
+#pragma unroll
+        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+            tile_B B;
+            load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
+
+            const int j = j0 + tile_C::get_j(0);
+            const float dB = __low2float(y_dm[j*MMQ_TILE_Y_K + k01/QI8_1]);
+
+#pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                tile_C C;
+                mma(C, A[n], B);
+
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += dA[n][l]*dB*C.x[l];
+                }
+            }
+        }
+    }
+
+    if (k00 == 0) {
+        // Only the warps of the first row group store, lanes 0-15 each own one column per j0.
+        if (i0 == 0 && threadIdx.x < 16) {
+#pragma unroll
+            for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+                const int j = j0 + tile_C::get_j(0);
+                const half2 * ds = y_dm + j*MMQ_TILE_Y_K;
+                s_sB[2*(jw + j) + 0] = __highs2half2(ds[0], ds[1]);
+                s_sB[2*(jw + j) + 1] = __highs2half2(ds[2], ds[3]);
+            }
+        }
+        return;
+    }
+
+    // Lanes 0-15 hold k 0..7 of the f16 fragments: the 8 blocks of the x tile.
+    // A is zero for lanes 16-31 (k 8..15), so B can hold any finite value there.
+    const bool lo = threadIdx.x < 16;
+    tile_M MA[ntx];
+#pragma unroll
+    for (int n = 0; n < ntx; ++n) {
+        const half2 * dm = x_dm + (i0 + n*tile_M::I + tile_M::get_i(0))*sram_stride;
+#pragma unroll
+        for (int b = 0; b < 4; ++b) {
+            const half2 m = __highs2half2(dm[2*b + 0], dm[2*b + 1]);
+            MA[n].x[b] = lo ? m : make_half2(0.0f, 0.0f);
+        }
+    }
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        const int j = j0 + tile_M::get_i(0);
+        const half2 * ds = y_dm + j*MMQ_TILE_Y_K;
+        tile_M MB;
+        MB.x[0] = s_sB[2*(jw + j) + 0];
+        MB.x[1] = s_sB[2*(jw + j) + 1];
+        MB.x[2] = __highs2half2(ds[0], ds[1]);
+        MB.x[3] = __highs2half2(ds[2], ds[3]);
+
+#pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            tile_S S;
+            mma(S, MA[n], MB);
+#pragma unroll
+            for (int l = 0; l < tile_S::ne; ++l) {
+                sum[(j0/tile_C::J + n)*tile_C::ne + l] += S.x[l];
+            }
+        }
+    }
+#elif defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  8, int, input_layout>        tile_A;
     typedef tile<16,  8, int, input_layout>        tile_B;

@@ -4608,6 +4608,27 @@ struct test_rwkv_wkv6 : public test_case {
 };
 
 // GGML_OP_GATED_DELTA_NET
+// Prefill GDN with log decay g <= 0 (as in qwen35): exercises the chunked path on RDNA4, which uses f16 matrix products.
+struct test_gated_delta_net_prefill : public test_case {
+    const int64_t head_count, v_repeat, n_seq_tokens;
+    std::string op_desc(ggml_tensor *) override { return "GATED_DELTA_NET_PREFILL"; }
+    std::string vars() override { return VARS_TO_STR3(head_count, v_repeat, n_seq_tokens); }
+    double max_nmse_err() override { return 1e-5; }
+    test_gated_delta_net_prefill(int64_t head_count, int64_t v_repeat, int64_t n_seq_tokens)
+        : head_count(head_count), v_repeat(v_repeat), n_seq_tokens(n_seq_tokens) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hs = 128;
+        auto * q = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, head_count, n_seq_tokens, 1), 1e-6f);
+        auto * k = ggml_l2_norm(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, head_count, n_seq_tokens, 1), 1e-6f);
+        auto * v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, head_count*v_repeat, n_seq_tokens, 1);
+        auto * g_raw = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count*v_repeat, n_seq_tokens, 1);
+        auto * g = ggml_scale(ctx, ggml_softplus(ctx, g_raw), -0.3f);
+        auto * beta = ggml_sigmoid(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, head_count*v_repeat, n_seq_tokens, 1));
+        auto * state = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, hs, head_count*v_repeat, 1);
+        return ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+    }
+};
+
 struct test_gated_delta_net : public test_case {
     const ggml_type type;
 
@@ -4622,6 +4643,11 @@ struct test_gated_delta_net : public test_case {
 
     std::string vars() override {
         return VARS_TO_STR9(type, head_count, head_size, n_seq_tokens, n_seqs, v_repeat, permuted, kda, K);
+    }
+
+    // Long prefills may use a chunked algorithm with f16 matrix products (RDNA4).
+    double max_nmse_err() override {
+        return n_seq_tokens >= 256 ? 1e-6 : 1e-7;
     }
 
     test_gated_delta_net(ggml_type type = GGML_TYPE_F32,
@@ -10166,6 +10192,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Chunked prefill GDN (partial last chunk, GQA heads), also with snapshots of the last K states.
+    for (int64_t tokens : {256, 300, 2048}) {
+        test_cases.emplace_back(new test_gated_delta_net_prefill(4, 3, tokens));
+    }
+    for (int64_t tokens : {256, 300, 2048}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, tokens, 1, 3, false, false, 5));
+    }
+    test_cases.emplace_back(new test_gated_delta_net_prefill(16, 3, 512));
 
     // Prefill GDN output norm/gate fused into the MMQ input quantization.
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {

@@ -543,7 +543,7 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     fattn_kernel_t fattn_kernel = flash_attn_ext_vec<D, cols_per_block, type_K, type_V, use_logit_softcap>;
 #if defined(GGML_USE_HIP)
     if constexpr (D == 256 && cols_per_block == 1 && type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
-        static const bool group_heads = [] { const char * v = getenv("GGML_HIP_FA_Q8_ORDER"); return v && std::atoi(v) != 0; }();
+        static const bool group_heads = [] { const char * v = getenv("GGML_HIP_FA_Q8_ORDER"); return !v || std::atoi(v) != 0; }();
         const auto * q = dst->src[0]; const auto * k = dst->src[1];
         if (group_heads && GGML_CUDA_CC_IS_RDNA4(cc) && q->ne[1] == 1 && q->ne[2] == 24 &&
                 q->ne[3] == 1 && k->ne[2] == 4 && k->ne[1] >= 8192) {

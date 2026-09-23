@@ -368,7 +368,7 @@ static __global__ void conv_prefill_direct(const float * old,const float * input
 void ggml_cuda_conv_prefill(ggml_backend_cuda_context & ctx,const ggml_tensor * cat,
         const ggml_tensor * weight,const ggml_tensor * state,ggml_tensor * output,bool scratch) {
     const int h=cat->ne[1],n=cat->src[1]->ne[0];
-    static const bool halo_enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_CONV_HALO"); return v && atoi(v)!=0; }();
+    static const bool halo_enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_CONV_HALO"); return !v || atoi(v)!=0; }();
     const auto disjoint=[](const ggml_tensor * a,const ggml_tensor * b) {
         const uintptr_t x=(uintptr_t)a->data,y=(uintptr_t)b->data;
         return x+ggml_nbytes(a)<=y || y+ggml_nbytes(b)<=x;

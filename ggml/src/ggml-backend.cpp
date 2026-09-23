@@ -1670,7 +1670,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         static const int batch_inputs_mode = [] {
             const char * value = getenv("GGML_SCHED_BATCH_INPUTS");
-            return value ? atoi(value) : 0;
+            return value ? atoi(value) : 3;
         }();
         const bool batch_host_inputs = batch_inputs_mode != 0 && split_backend->iface.set_tensor_async &&
             strncmp(ggml_backend_name(split_backend), "ROCm", 4) == 0;

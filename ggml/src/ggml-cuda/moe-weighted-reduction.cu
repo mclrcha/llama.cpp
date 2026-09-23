@@ -56,7 +56,7 @@ static void launch_moe_weighted_reduction(const float * experts,
                                           int           n_expert_used,
                                           cudaStream_t  stream) {
 #if defined(GGML_USE_HIP)
-    static const int mode=[] { const char * v=getenv("GGML_HIP_PREFILL_REDUCE"); return v ? atoi(v) : 0; }();
+    static const int mode=[] { const char * v=getenv("GGML_HIP_PREFILL_REDUCE"); return v ? atoi(v) : 1; }();
     if (mode && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
             n_expert_used==8 && !expert_scale && n_embd%512==0 && n_tokens>=32 && n_tokens<=65535) {
         moe_reduce_local<1><<<dim3(n_embd/256,n_tokens),256,0,stream>>>(experts,weights,dst,n_embd);

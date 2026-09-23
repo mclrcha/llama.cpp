@@ -1512,7 +1512,7 @@ bool ggml_cuda_can_fuse_shared_q8(const ggml_tensor * up, const ggml_tensor * ga
 #if defined(GGML_USE_HIP)
     static const bool enabled = [] {
         const char * value = getenv("GGML_HIP_Q8_SHARED_FFN");
-        return value && std::atoi(value) != 0;
+        return !value || std::atoi(value) != 0;
     }();
     return enabled && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
         up->type == GGML_TYPE_Q8_0 && gate->type == GGML_TYPE_Q8_0 && ggml_are_same_shape(up, gate) &&
@@ -1534,7 +1534,7 @@ bool ggml_cuda_can_fuse_mixed_mmvq(const ggml_tensor * up, const ggml_tensor * g
 #if defined(GGML_USE_HIP)
     static const int enabled = [] {
         const char * value = getenv("GGML_HIP_MIXED_FFN");
-        return value ? atoi(value) : 0;
+        return value ? atoi(value) : 2;
     }();
     const auto supported = [](ggml_type type) {
         return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS;
@@ -1883,7 +1883,7 @@ void ggml_cuda_mul_mat_vec_q(
             ne00 <= (ne11 == 1 ? 2048 : 8192) && ne01 >= 512 && ne01 <= 32768 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
         static const bool batch_row1 = [] {
             const char * value = std::getenv("GGML_HIP_Q8_BATCH_ROW1");
-            return value && std::atoi(value) != 0;
+            return !value || std::atoi(value) != 0;
         }();
         const bool single_row = batch_row1 && ne11 >= 2 && ne00 == 2048 && ne01 >= 4096 && ne01 <= 8192;
         const auto launch = [&](auto tokens) {
@@ -2159,7 +2159,7 @@ void ggml_cuda_q8_pair(ggml_backend_cuda_context & ctx, ggml_tensor * a, ggml_te
             quantize_row_q8_1_cuda(static_cast<const float *>(input->data),nullptr,q,GGML_TYPE_Q8_0,
                 2048,2048,2048*n_tokens,2048*n_tokens,2048,n_tokens,1,1,ctx.stream());
         }
-        static const bool batch_row1=[] { const char * v=std::getenv("GGML_HIP_Q8_BATCH_ROW1"); return v && std::atoi(v)!=0; }();
+        static const bool batch_row1=[] { const char * v=std::getenv("GGML_HIP_Q8_BATCH_ROW1"); return !v || std::atoi(v)!=0; }();
         const auto launch=[&](auto tokens,auto rows) {
             constexpr int rows_per_block=4*decltype(rows)::value;
             const int blocks_a=int((a->ne[0]+rows_per_block-1)/rows_per_block);

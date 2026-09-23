@@ -203,7 +203,7 @@ void ggml_cuda_launch_mm_ids_helper(
 #if defined(GGML_USE_HIP)
     static const int parallel = []() {
         const char * env = getenv("GGML_HIP_MOE_IDS_PARALLEL");
-        return env ? std::atoi(env) : 0;
+        return env ? std::atoi(env) : 1;
     }();
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     if (parallel && GGML_CUDA_CC_IS_RDNA4(cc) && n_expert_used == 8 &&

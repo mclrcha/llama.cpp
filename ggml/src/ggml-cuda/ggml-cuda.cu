@@ -2608,7 +2608,7 @@ static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
 #if defined(GGML_USE_HIP)
     static const bool token_cache = [] {
         const char * value = std::getenv("GGML_HIP_GRAPH_TOKEN_CACHE");
-        return value && std::atoi(value) != 0;
+        return !value || std::atoi(value) != 0;
     }();
     const int64_t n_tokens = cgraph->nodes[0]->ne[1];
     if (token_cache && cgraph->n_nodes <= 256 && n_tokens >= 1 && n_tokens <= 4) {
@@ -3522,7 +3522,7 @@ static int ggml_cuda_try_concat_copy_batch(ggml_backend_cuda_context & ctx, cons
 static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const int mode = [] {
         const char * value = getenv("GGML_HIP_GDN_GATES");
-        return value ? std::atoi(value) : 0;
+        return value ? std::atoi(value) : 2;
     }();
     if (!mode || ctx.curr_stream_no != 0 || !ctx.mmvq_cache.enabled ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
@@ -3600,7 +3600,7 @@ static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cgraph 
         if (!match) { continue; }
         static const bool direct_enabled = [] {
             const char * value = getenv("GGML_HIP_GDN_DIRECT_GATES");
-            return value && std::atoi(value) != 0;
+            return !value || std::atoi(value) != 0;
         }();
         bool direct = direct_enabled;
         for (const auto * source : inputs) {
@@ -3636,7 +3636,7 @@ static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cgraph 
 static int ggml_cuda_try_rms_scale(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const bool enabled = [] {
         const char * value = getenv("GGML_HIP_RMS_SCALE");
-        return value && std::atoi(value) != 0;
+        return !value || std::atoi(value) != 0;
     }();
     if (!enabled || ctx.curr_stream_no != 0 || !ctx.mmvq_cache.enabled || i+2 > graph->n_nodes ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
@@ -3664,7 +3664,7 @@ static int ggml_cuda_try_rms_scale(ggml_backend_cuda_context & ctx, ggml_cgraph 
 static int ggml_cuda_try_rms_pair(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const bool enabled = [] {
         const char * value = getenv("GGML_HIP_RMS_SCALE");
-        return value && std::atoi(value) >= 2;
+        return !value || std::atoi(value) >= 2;
     }();
     if (!enabled || ctx.curr_stream_no != 0 || !ctx.mmvq_cache.enabled || i+4 > graph->n_nodes ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
@@ -3715,7 +3715,7 @@ static int ggml_cuda_try_rms_pair(ggml_backend_cuda_context & ctx, ggml_cgraph *
 static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const int mode = [] {
         const char * value = getenv("GGML_HIP_RESIDUAL_RMS");
-        return value ? std::atoi(value) : 0;
+        return value ? std::atoi(value) : 3;
     }();
     if (!mode || ctx.curr_stream_no != 0 || !ctx.mmvq_cache.enabled || i+3 > graph->n_nodes ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
@@ -3830,7 +3830,7 @@ static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgra
 static int ggml_cuda_try_norm_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const bool enabled = [] {
         const char * value = getenv("GGML_HIP_GDN_NORM_GATE");
-        return value && std::atoi(value) != 0;
+        return !value || std::atoi(value) != 0;
     }();
     if (!enabled || ctx.curr_stream_no != 0 || !ctx.mmvq_cache.enabled || i+4 > graph->n_nodes ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
@@ -3865,7 +3865,7 @@ static int ggml_cuda_try_norm_gate(ggml_backend_cuda_context & ctx, ggml_cgraph 
     if (overlaps(norm,gate) || overlaps(mul,gate) || overlaps(norm,weight) || overlaps(dst,weight) ||
             (overlaps(dst,x) && dst->data != x->data) || (overlaps(dst,gate) && dst->data != gate->data)) { return 0; }
     static const bool quantize = [] {
-        const char * v = getenv("GGML_HIP_GDN_NORM_QUANT"); return v && std::atoi(v) != 0;
+        const char * v = getenv("GGML_HIP_GDN_NORM_QUANT"); return !v || std::atoi(v) != 0;
     }();
     int next = u+2;
     while (next < graph->n_nodes && next-u <= 4 && ggml_cuda_is_view_or_noop(graph->nodes[next])) { ++next; }
@@ -3977,7 +3977,7 @@ static int ggml_cuda_try_prefill_norm_gate(ggml_backend_cuda_context & ctx, ggml
 static int ggml_cuda_try_gdn_gather(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const bool enabled = [] {
         const char * value = getenv("GGML_HIP_GDN_GATHER");
-        return value && std::atoi(value) != 0;
+        return !value || std::atoi(value) != 0;
     }();
     if (!enabled || ctx.curr_stream_no != 0 || !ctx.mmvq_cache.enabled ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
@@ -4025,7 +4025,7 @@ static int ggml_cuda_try_gdn_gather(ggml_backend_cuda_context & ctx, ggml_cgraph
 static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int i) {
     static const int mode=[] {
         const char *value=getenv("GGML_HIP_CONV_PREPARE");
-        return value ? std::atoi(value) : 0;
+        return value ? std::atoi(value) : 2;
     }();
     if (!mode || ctx.curr_stream_no!=0 || !ctx.mmvq_cache.enabled ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
@@ -4201,7 +4201,7 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
 
 #if defined(GGML_USE_HIP)
 static int ggml_cuda_try_router_pair(ggml_backend_cuda_context &ctx,ggml_cgraph *graph,int i) {
-    static const bool enabled=[] { const char *v=getenv("GGML_HIP_ROUTER_PAIR");return v && std::atoi(v)!=0; }();
+    static const bool enabled=[] { const char *v=getenv("GGML_HIP_ROUTER_PAIR");return !v || std::atoi(v)!=0; }();
     if(!enabled || ctx.curr_stream_no!=0 || !ctx.mmvq_cache.enabled || i+1>=graph->n_nodes ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
     auto *a=graph->nodes[i];auto *b=graph->nodes[i+1];
@@ -4236,7 +4236,7 @@ static int ggml_cuda_try_router_pair(ggml_backend_cuda_context &ctx,ggml_cgraph 
 
 #if defined(GGML_USE_HIP)
 static int ggml_cuda_try_moe_down_reduce(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
-    static const bool enabled = [] { const char * v = getenv("GGML_HIP_MOE_DOWN_REDUCE"); return v && std::atoi(v) != 0; }();
+    static const bool enabled = [] { const char * v = getenv("GGML_HIP_MOE_DOWN_REDUCE"); return !v || std::atoi(v) != 0; }();
     if (!enabled || !ctx.mmvq_cache.enabled || ctx.curr_stream_no != 0 || i+1 >= graph->n_nodes ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
     const auto * down = graph->nodes[i];
@@ -4271,7 +4271,7 @@ static int ggml_cuda_try_moe_down_reduce(ggml_backend_cuda_context & ctx, ggml_c
 
 #if defined(GGML_USE_HIP)
 static int ggml_cuda_try_q8_pair(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int i) {
-    static const bool enabled=[] { const char *v=getenv("GGML_HIP_Q8_PAIR");return v && std::atoi(v)!=0; }();
+    static const bool enabled=[] { const char *v=getenv("GGML_HIP_Q8_PAIR");return !v || std::atoi(v)!=0; }();
     if(!enabled || !ctx.mmvq_cache.enabled || ctx.curr_stream_no!=0 || i+1>=graph->n_nodes ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
     auto *a=graph->nodes[i];auto *b=graph->nodes[i+1];
@@ -4305,7 +4305,7 @@ static int ggml_cuda_try_q8_pair(ggml_backend_cuda_context & ctx,ggml_cgraph * g
 
 #if defined(GGML_USE_HIP)
 static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int i) {
-    static const bool enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_SILU_QUANT"); return v && atoi(v)!=0; }();
+    static const bool enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_SILU_QUANT"); return !v || atoi(v)!=0; }();
     if(!enabled || ctx.curr_stream_no!=0 || !ctx.mmvq_cache.enabled ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
     auto * first=graph->nodes[i];
@@ -4321,7 +4321,7 @@ static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml
     auto * activation=graph->nodes[last];
     if(last+1>=graph->n_nodes) { return 0; }
     auto * out=graph->nodes[last+1];
-    static const bool experts_enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_EXPERT_SILU"); return v && atoi(v)!=0; }();
+    static const bool experts_enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_EXPERT_SILU"); return !v || atoi(v)!=0; }();
     const bool experts=experts_enabled && out->op==GGML_OP_MUL_MAT_ID;
     if((out->op!=GGML_OP_MUL_MAT && !experts) || out->src[1]!=activation || !ggml_are_same_shape(gate,up) ||
             !ggml_are_same_shape(gate,activation) || gate->ne[0]%512 || gate->ne[3]!=1) { return 0; }
@@ -4357,7 +4357,7 @@ static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml
 }
 
 static int ggml_cuda_try_conv_prefill(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int i) {
-    static const bool enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_CONV"); return v && atoi(v)!=0; }();
+    static const bool enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_CONV"); return !v || atoi(v)!=0; }();
     if(!enabled || ctx.curr_stream_no!=0 || !ctx.mmvq_cache.enabled ||
             !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) { return 0; }
     auto * cat=graph->nodes[i];
@@ -4460,7 +4460,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #if defined(GGML_USE_HIP)
     static const bool batch_conv_copies = [] {
         const char * value = std::getenv("GGML_HIP_CONV_COPY_BATCH");
-        return value && std::atoi(value) != 0;
+        return !value || std::atoi(value) != 0;
     }();
     if (batch_conv_copies && node->op == GGML_OP_CPY && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[cuda_ctx->device].cc)) {
         const int skip = ggml_cuda_try_concat_copy_batch(*cuda_ctx, cgraph, i);

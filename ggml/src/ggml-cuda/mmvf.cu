@@ -486,7 +486,7 @@ void launch_mul_mat_vec_f_cuda(
     if constexpr (std::is_same_v<T, float> && ncols_dst >= 1 && ncols_dst <= 4 && !is_multi_token_id) {
         static const bool exact_router = [] {
             const char * value = std::getenv("GGML_HIP_F32_ROUTER_EXACT");
-            return value && std::atoi(value) != 0;
+            return !value || std::atoi(value) != 0;
         }();
         if (exact_router && !ids && !fusion.gate && !fusion.x_bias && !fusion.gate_bias &&
                 ncols == 2048 && nrows >= 128 && nrows <= 512 && stride_row == 2048 &&

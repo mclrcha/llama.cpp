@@ -3513,7 +3513,7 @@ ggml_tensor * llm_graph_context::build_rs(
     // {state_size, rs_size} -> {state_size, n_seqs}
     ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
     const char * defer_env = std::getenv("LLAMA_GDN_DEFER_STATE");
-    const bool defer = defer_env && std::atoi(defer_env) != 0 && ubatch.n_tokens == 1 &&
+    const bool defer = (!defer_env || std::atoi(defer_env) != 0) && ubatch.n_tokens == 1 &&
         n_rs == 1 && n_seqs == 1 && state_size >= 128*128;
     if (!defer) { ggml_build_forward_expand(gf, output_states); }
 

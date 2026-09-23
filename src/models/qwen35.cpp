@@ -383,7 +383,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
     const char * prefill_state_env = std::getenv("LLAMA_GDN_PREFILL_EARLY_STATE");
-    const bool early_state = prefill_state_env && std::atoi(prefill_state_env) != 0 &&
+    const bool early_state = (!prefill_state_env || std::atoi(prefill_state_env) != 0) &&
         n_seq_tokens >= 32 && n_seqs == 1 && cparams.n_rs_seq == 0;
     ggml_tensor * state = nullptr;
     if (early_state) {

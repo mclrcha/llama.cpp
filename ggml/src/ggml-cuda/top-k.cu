@@ -399,7 +399,7 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (ncols > 1024) {
         static const bool tournament = []() {
             const char * env = getenv("GGML_HIP_TOPK_TOURNAMENT");
-            return env && std::atoi(env) != 0;
+            return !env || std::atoi(env) != 0;
         }();
         const int cc = ggml_cuda_info().devices[ctx.device].cc;
         if (tournament && GGML_CUDA_CC_IS_RDNA4(cc) && k >= 1 && k <= 32 && nrows <= 4 && ncols <= (1 << 20)) {

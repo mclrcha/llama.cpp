@@ -210,12 +210,12 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 #if defined(GGML_USE_HIP)
         static const bool flatten_short_rows = [] {
             const char * value = std::getenv("GGML_HIP_CONCAT_FLAT");
-            return value && std::atoi(value) != 0;
+            return !value || std::atoi(value) != 0;
         }();
         const int64_t n = ggml_nelements(dst);
         static const int transpose_rows = []() {
             const char * env = getenv("GGML_HIP_CONCAT_TRANSPOSE");
-            return env ? std::atoi(env) : 0;
+            return env ? std::atoi(env) : 2;
         }();
         if (transpose_rows == 2 && src0->type == GGML_TYPE_F32 && dim == 0 &&
                 dst->ne[0] >= 128 && dst->ne[0] <= 32*65535 && dst->ne[1] == 8192 &&

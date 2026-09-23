@@ -618,7 +618,7 @@ static void launch_gated_delta_net(
 #if defined(GGML_USE_HIP)
     static const bool prefill_clustered = []() {
         const char * env = getenv("GGML_HIP_GDN_PREFILL_GEOMETRY");
-        return env && std::atoi(env) == 3;
+        return !env || std::atoi(env) == 3;
     }();
     if constexpr (!KDA) {
         if (prefill_clustered && GGML_CUDA_CC_IS_RDNA4(cc) && S_v == 128 && n_tokens >= 32 && !state_indices) {
@@ -635,7 +635,7 @@ static void launch_gated_delta_net(
 #if defined(GGML_USE_HIP)
         static const bool clustered = []() {
             const char * env = getenv("GGML_HIP_GDN_CLUSTER_EXACT");
-            return env && std::atoi(env) != 0;
+            return !env || std::atoi(env) != 0;
         }();
         if constexpr (!KDA) {
             if ((clustered || state_indices) && n_tokens >= 1 && n_tokens <= 4) {

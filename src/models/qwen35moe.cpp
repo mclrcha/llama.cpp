@@ -378,7 +378,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
 
     // Keep the shared projection input alive when direct gate outputs are requested.
     const char *keep_env=std::getenv("LLAMA_GDN_KEEP_INPUT");
-    if(keep_env && std::atoi(keep_env)!=0 && ubatch.n_tokens==1 && n_embd==2048) {
+    if((!keep_env || std::atoi(keep_env)!=0) && ubatch.n_tokens==1 && n_embd==2048) {
         ggml_set_output(cur);
     }
 
@@ -388,7 +388,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     ggml_tensor * z         = qkvz.second;
 
     const char * early_z_env = std::getenv("LLAMA_GDN_EARLY_Z");
-    const int early_z = early_z_env ? std::atoi(early_z_env) : 0;
+    const int early_z = early_z_env ? std::atoi(early_z_env) : 3;
     // Small batches (speculative verification) too: keeps the output norm, gate and Q8_1 quantization adjacent.
     static const bool early_z_batch = [] {
         const char * value = std::getenv("LLAMA_GDN_EARLY_Z_BATCH");
@@ -431,7 +431,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
 
     const char * prefill_state_env = std::getenv("LLAMA_GDN_PREFILL_EARLY_STATE");
-    const bool early_state = prefill_state_env && std::atoi(prefill_state_env) != 0 &&
+    const bool early_state = (!prefill_state_env || std::atoi(prefill_state_env) != 0) &&
         n_seq_tokens >= 32 && n_seqs == 1 && cparams.n_rs_seq == 0;
     ggml_tensor * state = nullptr;
     if (early_state) {
@@ -536,14 +536,14 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
         const char * value=std::getenv("LLAMA_MOE_EARLY_SHARED_BATCH");
         return !value || std::atoi(value)!=0;
     }();
-    const int early=(ubatch.n_tokens==1 || (early_shared_batch && ubatch.n_tokens<=4)) && n_embd==2048 && early_env ? std::atoi(early_env) : 0;
+    const int early=(ubatch.n_tokens==1 || (early_shared_batch && ubatch.n_tokens<=4)) && n_embd==2048 ? (early_env ? std::atoi(early_env) : 1) : 0;
     const char *gate_env=std::getenv("LLAMA_MOE_EARLY_GATE");
     // Small batches (speculative verification) too: puts the shared gate next to the router for the paired matvec.
     static const bool early_gate_batch=[] {
         const char * value=std::getenv("LLAMA_MOE_EARLY_GATE_BATCH");
         return !value || std::atoi(value)!=0;
     }();
-    const bool early_gate=gate_env && std::atoi(gate_env)!=0 &&
+    const bool early_gate=(!gate_env || std::atoi(gate_env)!=0) &&
         (ubatch.n_tokens==1 || (early_gate_batch && ubatch.n_tokens<=4)) && n_embd==2048;
     ggml_tensor *shared_gate_early=nullptr;
     auto build_routed=[&]() {

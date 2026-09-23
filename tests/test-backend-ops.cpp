@@ -10599,7 +10599,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int64_t width : {2048, 5120}) {
-        for (int64_t tokens : {1, 2, 3, 4, 5}) {
+        for (int64_t tokens : {1, 2, 3, 4, 5, 64, 300}) {
             for (bool inplace : {false, true}) {
                 test_cases.emplace_back(new test_residual_chain(width, tokens, inplace));
             }
@@ -10612,7 +10612,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int64_t width : {2048, 5120}) {
-        for (int64_t tokens : {1, 2, 3, 4, 5}) {
+        for (int64_t tokens : {1, 2, 3, 4, 5, 64, 300, 2048}) {
             for (bool inplace : {false, true}) {
                 test_cases.emplace_back(new test_residual_rms(width, tokens, inplace));
             }

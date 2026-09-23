@@ -1614,9 +1614,44 @@ struct ggml_hip_mmq_cache {
         return static_cast<char *>(data[k]);
     }
 
+    // A producer writes the quantized copy of its own output: the slot becomes valid in commit(), after the graph loop has
+    // invalidated the slots that overlap the fused nodes. Returns nullptr like acquire.
+    const ggml_tensor * pending[nslots] = {nullptr};
+    char * reserve(const int k, const ggml_tensor * source, const int ds_layout, const size_t nbytes, cudaStream_t stream) {
+        if (nbytes > max_size) {
+            return nullptr;
+        }
+        if (size[k] < nbytes) {
+            hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+            CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+            if (status != hipStreamCaptureStatusNone) {
+                return nullptr;
+            }
+            if (data[k]) {
+                CUDA_CHECK(cudaFree(data[k]));
+            }
+            CUDA_CHECK(cudaMalloc(&data[k], nbytes));
+            size[k] = nbytes;
+        }
+        src[k]     = nullptr;
+        pending[k] = source;
+        layout[k]  = ds_layout;
+        return static_cast<char *>(data[k]);
+    }
+
+    void commit() {
+        for (int k = 0; k < nslots; ++k) {
+            if (pending[k]) {
+                src[k]     = pending[k];
+                pending[k] = nullptr;
+            }
+        }
+    }
+
     void reset() {
         for (int k = 0; k < nslots; ++k) {
-            src[k] = nullptr;
+            src[k]     = nullptr;
+            pending[k] = nullptr;
         }
     }
 

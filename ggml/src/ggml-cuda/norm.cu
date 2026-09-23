@@ -771,10 +771,20 @@ void ggml_cuda_op_rms_norm_scale_pair_128(ggml_backend_cuda_context & ctx,
 #endif
 
 #if defined(GGML_USE_HIP)
-template<int width, bool chain, bool gated, bool quantize>
+// Same layout as block_q8_1_mmq (mmq.cuh).
+struct residual_mmq_block {
+    union {
+        float d4[4];
+        half2 ds4[4];
+    };
+    int8_t qs[128];
+};
+static_assert(sizeof(residual_mmq_block) == 144, "bad residual_mmq_block size");
+
+template<int width, bool chain, bool gated, bool quantize, bool mmq = false>
 static __global__ void residual_rms_f32(const float * a, const float * b, const float * weight,
                                       float * residual, float * normalized, float eps, const float * c, const float * gate,
-                                      block_q8_1 * quantized) {
+                                      block_q8_1 * quantized, residual_mmq_block * mmq_d4 = nullptr, residual_mmq_block * mmq_ds4 = nullptr) {
     const int tid = threadIdx.x, base = blockIdx.x * width;
     float values[width/1024];
     float sum = 0.0f;
@@ -806,6 +816,29 @@ static __global__ void residual_rms_f32(const float * a, const float * b, const 
             value = scale * values[j] * weight[col];
         }
         normalized[base+col] = value;
+        if constexpr (mmq) {
+            // Prefill: MMQ q8_1 copies (D4 and DS4 layouts) with the reductions of quantize_mmq_q8_1:
+            // block sum ((v0+v1)+v2)+v3 per 4 values, then a butterfly over the 8 groups of the 32 value block.
+            const int lane = tid % 32;
+            const float amax = warp_reduce_max<32>(fabsf(value));
+            const float n1 = __shfl_xor_sync(0xFFFFFFFF, value, 1, 32);
+            const float n2 = __shfl_xor_sync(0xFFFFFFFF, value, 2, 32);
+            const float n3 = __shfl_xor_sync(0xFFFFFFFF, value, 3, 32);
+            float bsum = value + n1 + n2 + n3;
+            bsum += __shfl_xor_sync(0xFFFFFFFF, bsum, 16, 32);
+            bsum += __shfl_xor_sync(0xFFFFFFFF, bsum,  8, 32);
+            bsum += __shfl_xor_sync(0xFFFFFFFF, bsum,  4, 32);
+            const float d_inv = 127.0f / amax;
+            const int8_t q = roundf(value*d_inv);
+            const float d = 1.0f / d_inv;
+            const int64_t ib = int64_t(col/128)*gridDim.x + blockIdx.x;
+            mmq_d4 [ib].qs[col % 128] = q;
+            mmq_ds4[ib].qs[col % 128] = q;
+            if (lane == 0) {
+                mmq_d4 [ib].d4 [(col % 128)/32] = d;
+                mmq_ds4[ib].ds4[(col % 128)/32] = make_half2(d, bsum);
+            }
+        }
         if constexpr (quantize) {
             // Same lane mapping and reductions as quantize_q8_1: each warp holds one block of 32 values.
             const float amax = warp_reduce_max<QK8_1>(fabsf(value));
@@ -823,21 +856,25 @@ static __global__ void residual_rms_f32(const float * a, const float * b, const 
 
 void ggml_cuda_op_residual_rms(ggml_backend_cuda_context & ctx, ggml_tensor * add,
                              const ggml_tensor * norm, const ggml_tensor * weight, ggml_tensor * dst,
-                             const ggml_tensor * first, const ggml_tensor * gated_mul, void * quantized) {
+                             const ggml_tensor * first, const ggml_tensor * gated_mul, void * quantized,
+                             void * mmq_d4, void * mmq_ds4) {
     float eps; memcpy(&eps, norm->op_params, sizeof(float));
     const ggml_cuda_kernel_launch_params params(dim3(add->ne[1]), dim3(1024), 32*sizeof(float), ctx.stream());
     const auto * input = first ? first : add;
-    const auto launch_q = [&](auto width, auto chain, auto gated, auto q8) {
-        ggml_cuda_kernel_launch(residual_rms_f32<decltype(width)::value, decltype(chain)::value, decltype(gated)::value, decltype(q8)::value>, params,
+    GGML_ASSERT(!(mmq_d4 || mmq_ds4) || (mmq_d4 && mmq_ds4 && !quantized));
+    const auto launch_q = [&](auto width, auto chain, auto gated, auto q8, auto mmq) {
+        ggml_cuda_kernel_launch(residual_rms_f32<decltype(width)::value, decltype(chain)::value, decltype(gated)::value, decltype(q8)::value,
+                decltype(mmq)::value>, params,
             static_cast<const float *>(input->src[0]->data), static_cast<const float *>((gated_mul ? gated_mul->src[0] : input->src[1])->data),
             static_cast<const float *>(weight->data), static_cast<float *>(add->data), static_cast<float *>(dst->data), eps,
             first ? static_cast<const float *>(add->src[1]->data) : nullptr,
             gated_mul ? static_cast<const float *>(gated_mul->src[1]->src[0]->data) : nullptr,
-            static_cast<block_q8_1 *>(quantized));
+            static_cast<block_q8_1 *>(quantized), static_cast<residual_mmq_block *>(mmq_d4), static_cast<residual_mmq_block *>(mmq_ds4));
     };
     const auto launch = [&](auto width, auto chain, auto gated) {
-        if (quantized) { launch_q(width, chain, gated, std::true_type{}); }
-        else { launch_q(width, chain, gated, std::false_type{}); }
+        if (quantized) { launch_q(width, chain, gated, std::true_type{}, std::false_type{}); }
+        else if (mmq_d4) { launch_q(width, chain, gated, std::false_type{}, std::true_type{}); }
+        else { launch_q(width, chain, gated, std::false_type{}, std::false_type{}); }
     };
     const auto launch_width = [&](auto width) {
         if (gated_mul) { launch(width, std::true_type{}, std::true_type{}); }

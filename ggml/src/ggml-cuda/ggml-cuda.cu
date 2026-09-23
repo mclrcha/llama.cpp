@@ -3732,9 +3732,14 @@ static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgra
     auto * first = chain ? graph->nodes[i+prefix] : nullptr;
     const int offset = prefix + (chain ? 1 : 0);
     auto * add = graph->nodes[i+offset]; auto * norm = graph->nodes[i+offset+1]; auto * mul = graph->nodes[i+offset+2];
+    // Prefill rows use the same kernel (one block per token); GGML_HIP_PREFILL_RESIDUAL_RMS=0 limits it to decode.
+    static const bool prefill = [] {
+        const char * value = getenv("GGML_HIP_PREFILL_RESIDUAL_RMS");
+        return !value || std::atoi(value) != 0;
+    }();
     if (add->op != GGML_OP_ADD || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
             norm->src[0] != add || mul->src[0] != norm ||
-            (add->ne[0] != 2048 && add->ne[0] != 5120) || add->ne[1] < 1 || add->ne[1] > 4 ||
+            (add->ne[0] != 2048 && add->ne[0] != 5120) || add->ne[1] < 1 || add->ne[1] > (prefill ? 65535 : 4) ||
             add->ne[2] != 1 || add->ne[3] != 1) { return 0; }
     const auto * weight = mul->src[1];
     if (!ggml_are_same_shape(add, add->src[0]) || !ggml_are_same_shape(add, add->src[1]) ||
@@ -3801,7 +3806,22 @@ static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgra
     if (quantize && size_t(add->ne[1])*(add->ne[0]/QK8_1)*sizeof(block_q8_1) <= ctx.mmvq_cache.capacity) {
         quantized = ctx.mmvq_cache.reserve(mul);
     }
-    ggml_cuda_op_residual_rms(ctx, add, norm, weight, mul, first, gated_mul, quantized);
+    // Prefill: also write the MMQ inputs of the following projections (both scale layouts) into the MMQ cache.
+    static const bool mmq_out = [] {
+        const char * value = getenv("GGML_HIP_PREFILL_RESIDUAL_MMQ");
+        return !value || std::atoi(value) != 0;
+    }();
+    void * mmq_d4 = nullptr, * mmq_ds4 = nullptr;
+    if (mmq_out && !quantized && add->ne[1] >= 64 && ctx.mmvq_cache.enabled) {
+        const size_t nbytes = size_t(add->ne[1])*(add->ne[0]/128)*144 + 128*144;
+        mmq_d4  = ctx.mmq_cache.reserve(0, mul, MMQ_Q8_1_DS_LAYOUT_D4,  nbytes, ctx.stream());
+        mmq_ds4 = mmq_d4 ? ctx.mmq_cache.reserve(1, mul, MMQ_Q8_1_DS_LAYOUT_DS4, nbytes, ctx.stream()) : nullptr;
+        if (!mmq_ds4) {
+            ctx.mmq_cache.reset();
+            mmq_d4 = nullptr;
+        }
+    }
+    ggml_cuda_op_residual_rms(ctx, add, norm, weight, mul, first, gated_mul, quantized, mmq_d4, mmq_ds4);
     return 2+offset;
 }
 #endif
@@ -5333,6 +5353,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cuda_ctx->mmq_cache.invalidate_write(cgraph->nodes[j]);
                     }
                     cuda_ctx->mmvq_cache.commit();
+                    cuda_ctx->mmq_cache.commit();
 #endif
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;

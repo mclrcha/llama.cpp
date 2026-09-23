@@ -5310,6 +5310,39 @@ struct test_gdn_gates : public test_case {
     }
 };
 
+// GDN output of a prefill: rms_norm(x)*w * silu(z), reshaped to the input of the output projection.
+struct test_prefill_norm_gate : public test_case {
+    const ggml_type type;
+    const int64_t heads, tokens, m;
+    const bool external, gate_proj;
+    test_prefill_norm_gate(ggml_type type, int64_t heads, int64_t tokens, int64_t m, bool external = false, bool gate_proj = false)
+        : type(type), heads(heads), tokens(tokens), m(m), external(external), gate_proj(gate_proj) {}
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "PREFILL_NORM_GATE"; }
+    std::string vars() override { return VARS_TO_STR6(type, heads, tokens, m, external, gate_proj); }
+    double max_nmse_err() override { return 5e-4; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, heads, tokens);
+        ggml_tensor * z;
+        if (gate_proj) {
+            // Gate projection between the norm and the SiLU in graph order, as in the dense model.
+            auto * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, tokens);
+            auto * wz  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 512, 128*heads);
+            z = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wz, inp), 128, heads, tokens);
+        } else {
+            z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, heads, tokens);
+        }
+        auto * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        auto * weight = ggml_new_tensor_2d(ctx, type, 128*heads, m);
+        auto * gated = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), ggml_silu(ctx, z));
+        auto * out = ggml_mul_mat(ctx, weight, ggml_reshape_2d(ctx, gated, 128*heads, tokens));
+        if (external) {
+            out = ggml_concat(ctx, out, ggml_reshape_2d(ctx, gated, 128*heads, tokens), 0);
+        }
+        return out;
+    }
+};
+
 struct test_mul_mat_reuse : public test_case {
     const ggml_type type;
     const int64_t n;
@@ -10115,8 +10148,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 32, 1, 32)); // too small (N<64)
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 1024, 1, 1024)); // too big (N>512)
 
-    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS}) {
-        for (int64_t n : {1, 4}) {
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {1, 4, 128, 300}) {
             for (bool strided : {false, true}) {
                 for (bool overwrite : {false, true}) {
                     test_cases.emplace_back(new test_mul_mat_reuse(type, n, strided, overwrite));
@@ -10133,6 +10166,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // Prefill GDN output norm/gate fused into the MMQ input quantization.
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS}) {
+        for (int64_t tokens : {64, 300}) {
+            test_cases.emplace_back(new test_prefill_norm_gate(type, 48, tokens, 200));
+        }
+        test_cases.emplace_back(new test_prefill_norm_gate(type, 32, 128, 256));
+        test_cases.emplace_back(new test_prefill_norm_gate(type, 48, 64, 128, true));
+        test_cases.emplace_back(new test_prefill_norm_gate(type, 48, 300, 200, false, true));
+    }
+    test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 48, 2048, 256));
+    test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 48, 16, 256));
 
     // Dense prefill MMQ: partial row/column tiles, several K tiles, stream-k and non stream-k tile counts.
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
@@ -10579,10 +10624,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (int64_t tokens : {1, 4}) {
+    for (int64_t tokens : {1, 4, 64, 2048}) {
         for (bool external : {false, true}) {
             test_cases.emplace_back(new test_rms_pair_shared(tokens, external));
         }
+    }
+    for (bool strided : {false, true}) {
+        test_cases.emplace_back(new test_rms_pair(16, 300, strided));
     }
 
     for (int64_t heads : {16, 48}) {

@@ -707,6 +707,121 @@ void quantize_mmq_fp4_cuda(
 }
 
 #if defined(GGML_USE_HIP)
+// Prefill GDN output: rms_norm(x)*w * silu(g) for rows of 128 values, written as MMQ q8_1 blocks.
+// One warp per (token, head), 4 values per lane. The sum of squares follows rms_norm_f32<256> for 128 columns and the
+// quantization follows quantize_mmq_q8_1, so the result is bit identical to the unfused path.
+template <mmq_q8_1_ds_layout ds_layout>
+static __global__ void quantize_mmq_norm_gate_128(const float * __restrict__ x, const float * __restrict__ w,
+        const float * __restrict__ g, void * __restrict__ vy, const float eps, const int nheads, const int ne1) {
+    const int t    = blockIdx.x;
+    const int h    = blockIdx.y*blockDim.y + threadIdx.y;
+    const int lane = threadIdx.x;
+    if (h >= nheads) {
+        return;
+    }
+    const int64_t base = (int64_t(t)*nheads + h)*128 + 4*lane;
+    const float4 xv = *(const float4 *) (x + base);
+    const float4 gv = *(const float4 *) (g + base);
+    const float4 wv = *(const float4 *) (w + 4*lane);
+
+    // Per 32 value group: butterfly 16, 8, 4 across lanes (lane xor 4, 2, 1), then 2 and 1 inside the lane.
+    // The squares are rounded before the sum like in rms_norm_f32: no contraction into the first addition.
+    float q[4];
+    {
+#pragma clang fp contract(off)
+        q[0] = xv.x*xv.x;
+        q[1] = xv.y*xv.y;
+        q[2] = xv.z*xv.z;
+        q[3] = xv.w*xv.w;
+    }
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            q[c] += __shfl_xor_sync(0xFFFFFFFF, q[c], offset, WARP_SIZE);
+        }
+    }
+    const float group = (q[0] + q[2]) + (q[1] + q[3]);
+    // Across the 4 groups (the other 4 warps of the 256 thread block hold zeros).
+    const float pair  = group + __shfl_xor_sync(0xFFFFFFFF, group, 16, WARP_SIZE);
+    const float total = pair  + __shfl_xor_sync(0xFFFFFFFF, pair,   8, WARP_SIZE);
+    float scale;
+    {
+        // rms_norm_f32 divides by a runtime column count: keep the mean rounded before adding eps.
+#pragma clang fp contract(off)
+        const float mean = total / 128;
+        scale = rsqrtf(mean + eps);
+    }
+
+    const float4 sv = make_float4(ggml_cuda_op_silu_single(gv.x), ggml_cuda_op_silu_single(gv.y),
+                                  ggml_cuda_op_silu_single(gv.z), ggml_cuda_op_silu_single(gv.w));
+    float4 xi;
+    {
+        // The unfused path stores these products: no contraction into the block sum below.
+#pragma clang fp contract(off)
+        xi.x = sv.x * (scale * xv.x * wv.x);
+        xi.y = sv.y * (scale * xv.y * wv.y);
+        xi.z = sv.z * (scale * xv.z * wv.z);
+        xi.w = sv.w * (scale * xv.w * wv.w);
+    }
+
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int offset = 4; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+    }
+    float sum = 0.0f;
+    if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+        sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+        for (int offset = 4; offset > 0; offset >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+        }
+    }
+    const float d_inv = 127.0f / amax;
+    char4 qv;
+    qv.x = roundf(xi.x*d_inv);
+    qv.y = roundf(xi.y*d_inv);
+    qv.z = roundf(xi.z*d_inv);
+    qv.w = roundf(xi.w*d_inv);
+    const float d = 1.0f / d_inv;
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy + int64_t(h)*ne1 + t;
+    ((char4 *) y->qs)[lane] = qv;
+    if (lane % 8 == 0) {
+        if constexpr (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+            y->ds4[lane/8] = make_half2(d, sum);
+        } else {
+            y->d4[lane/8] = d;
+        }
+    }
+}
+
+bool quantize_mmq_norm_gate_supported(ggml_type type) {
+    const mmq_q8_1_ds_layout layout = mmq_get_q8_1_ds_layout(type);
+    return layout == MMQ_Q8_1_DS_LAYOUT_D4 || layout == MMQ_Q8_1_DS_LAYOUT_DS4;
+}
+
+void quantize_mmq_norm_gate_cuda(const float * x, const float * w, const float * g, float eps, void * dst, ggml_type type,
+        int nheads, int n, cudaStream_t stream) {
+    constexpr int heads_per_block = 4;
+    const dim3 grid(n, (nheads + heads_per_block - 1)/heads_per_block);
+    const dim3 block(WARP_SIZE, heads_per_block);
+    switch (mmq_get_q8_1_ds_layout(type)) {
+        case MMQ_Q8_1_DS_LAYOUT_D4:
+            quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n);
+            break;
+        case MMQ_Q8_1_DS_LAYOUT_DS4:
+            quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n);
+            break;
+        default:
+            GGML_ABORT("unsupported MMQ layout");
+    }
+}
+
 void quantize_mmq_silu_cuda(const float * gate,const float * up,void * dst,ggml_type type,
         int64_t k,int64_t n,cudaStream_t stream,const int32_t * ids) {
     const dim3 grid(n,k/(4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ));

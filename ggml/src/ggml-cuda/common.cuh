@@ -1570,6 +1570,71 @@ struct ggml_hip_mmvq_cache {
 };
 #endif
 
+#if defined(GGML_USE_HIP)
+// MMQ q8_1 copies of recent prefill matrix inputs, keyed by source data and scale layout: an activation that feeds several
+// projections (q/k/v, GDN qkv/z/alpha/beta, FFN gate/up) is quantized once per layout. Writes are tracked like above.
+struct ggml_hip_mmq_cache {
+    static constexpr int    nslots   = 2;
+    static constexpr size_t max_size = size_t(64) << 20; // per slot
+    void *              data  [nslots] = {nullptr};
+    size_t              size  [nslots] = {0};
+    const ggml_tensor * src   [nslots] = {nullptr};
+    int                 layout[nslots] = {0};
+    int last = 0;
+
+    // Returns nullptr if the input is too large or the slot cannot grow (stream capture).
+    char * acquire(const ggml_tensor * source, const int ds_layout, const size_t nbytes, cudaStream_t stream, bool & reuse) {
+        reuse = false;
+        for (int k = 0; k < nslots; ++k) {
+            if (layout[k] == ds_layout && ggml_hip_mmvq_cache::same_data(src[k], source) && size[k] >= nbytes) {
+                reuse = true;
+                last  = k;
+                return static_cast<char *>(data[k]);
+            }
+        }
+        if (nbytes > max_size) {
+            return nullptr;
+        }
+        const int k = (last + 1) % nslots;
+        if (size[k] < nbytes) {
+            hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+            CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+            if (status != hipStreamCaptureStatusNone) {
+                return nullptr;
+            }
+            if (data[k]) {
+                CUDA_CHECK(cudaFree(data[k]));
+            }
+            CUDA_CHECK(cudaMalloc(&data[k], nbytes));
+            size[k] = nbytes;
+        }
+        last      = k;
+        src[k]    = source;
+        layout[k] = ds_layout;
+        return static_cast<char *>(data[k]);
+    }
+
+    void reset() {
+        for (int k = 0; k < nslots; ++k) {
+            src[k] = nullptr;
+        }
+    }
+
+    void invalidate_write(const ggml_tensor * dst) {
+        const uintptr_t b = reinterpret_cast<uintptr_t>(dst->data);
+        for (int k = 0; k < nslots; ++k) {
+            if (!src[k]) {
+                continue;
+            }
+            const uintptr_t a = reinterpret_cast<uintptr_t>(src[k]->data);
+            if (a < b + ggml_nbytes(dst) && b < a + ggml_nbytes(src[k])) {
+                src[k] = nullptr;
+            }
+        }
+    }
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1584,6 +1649,7 @@ struct ggml_backend_cuda_context {
 
 #if defined(GGML_USE_HIP)
     ggml_hip_mmvq_cache mmvq_cache;
+    ggml_hip_mmq_cache  mmq_cache;
 #endif
 
 #ifdef USE_CUDA_GRAPH

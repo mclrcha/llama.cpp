@@ -330,7 +330,9 @@ static __global__ void conv_prefill_halo(const float * old, const float * input,
         halo[(size_t(blockIdx.y)*3+j)*h+c]=begin==0 ? old[3*c+j] : input[size_t(begin+j-3)*h+c];
     }
 }
-template <bool halo_input = false>
+// shifted: the output starts 3 tokens before the input, so the next chunk overwrites the last 3 inputs of this chunk;
+// they are read from the next chunk's halo instead.
+template <bool halo_input = false, bool shifted = false>
 static __global__ void conv_prefill_direct(const float * old,const float * input,const float * weights,
         float * state,float * output,int h,int n) {
     const int c=blockIdx.x*128+threadIdx.x;
@@ -345,7 +347,11 @@ static __global__ void conv_prefill_direct(const float * old,const float * input
     }
     const int end=min(begin+32,n);
     for(int t=begin;t<end;++t) {
-        x[3]=input[(size_t)t*h+c];
+        if(shifted && end<n && t>=end-3) {
+            x[3]=old[(size_t(blockIdx.y+1)*3+(t-(end-3)))*h+c];
+        } else {
+            x[3]=input[(size_t)t*h+c];
+        }
         float sum=0.0f;
 #pragma unroll
         for(int j=0;j<4;++j) { sum+=x[j]*w[j]; }
@@ -374,6 +380,22 @@ void ggml_cuda_conv_prefill(ggml_backend_cuda_context & ctx,const ggml_tensor * 
             (const float *)cat->src[1]->data,(float *)cat->data,h);
         CUDA_CHECK(cudaGetLastError());
         conv_prefill_direct<true><<<grid,128,0,ctx.stream()>>>((const float *)cat->data,
+            (const float *)cat->src[1]->data,(const float *)weight->data,(float *)state->data,(float *)output->data,h,n);
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
+    // Output starts at the old state, 3 tokens before the input: each channel writes token t over input t-3, which the
+    // same thread has already read. The 3 tokens before each 32 token chunk are saved first: the chunk reads them as its
+    // start and the previous chunk as its last inputs, because this chunk overwrites them.
+    static const bool shifted_enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_CONV_SHIFTED"); return !v || atoi(v)!=0; }();
+    const char * old_d=(const char *)cat->src[0]->data;
+    if(shifted_enabled && scratch && output->data==old_d && (const char *)cat->src[1]->data==old_d+ggml_nbytes(cat->src[0]) &&
+            ggml_nbytes(output)==ggml_nbytes(cat->src[1]) && disjoint(cat,output) && disjoint(cat,cat->src[1]) &&
+            disjoint(cat,weight) && disjoint(output,weight) && size_t((n+31)/32)*3*h*sizeof(float)<=ggml_nbytes(cat)) {
+        const dim3 grid((h+127)/128,(n+31)/32);
+        conv_prefill_halo<<<grid,128,0,ctx.stream()>>>((const float *)old_d,(const float *)cat->src[1]->data,(float *)cat->data,h);
+        CUDA_CHECK(cudaGetLastError());
+        conv_prefill_direct<true,true><<<grid,128,0,ctx.stream()>>>((const float *)cat->data,
             (const float *)cat->src[1]->data,(const float *)weight->data,(float *)state->data,(float *)output->data,h,n);
         CUDA_CHECK(cudaGetLastError());
         return;

@@ -8150,6 +8150,34 @@ struct test_flash_attn_ext : public test_case {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT with a causal mask at KV depth (prompt processing with a filled KV cache):
+// token t attends KV rows [0, kv - nb + t], the other rows are -inf.
+struct test_flash_attn_ext_causal : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",causal=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                GGML_ASSERT(t->type == GGML_TYPE_F16);
+                const int64_t n = ggml_nelements(t);
+                std::vector<ggml_fp16_t> data(n);
+                for (int64_t i = 0; i < n; ++i) {
+                    const int64_t i0 = i % t->ne[0];
+                    const int64_t i1 = (i / t->ne[0]) % t->ne[1];
+                    data[i] = ggml_fp32_to_fp16(i0 <= kv - nb + i1 ? 0.0f : -INFINITY);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_CROSS_ENTROPY_LOSS
 struct test_cross_entropy_loss : public test_case {
     const ggml_type type;
@@ -9273,6 +9301,17 @@ static void add_qwen_kv_cases(std::vector<std::unique_ptr<test_case>> & cases, b
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     add_qwen_kv_cases(test_cases, false);
+    // Qwen3.x prefill shapes with a causal mask at depth: masked and unmasked KV tiles, partial token blocks.
+    for (int nh : {2, 4}) {
+        const int gqa = nh == 2 ? 8 : 6;
+        const ggml_type type = nh == 2 ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+        for (auto kv_nb : std::vector<std::pair<int, int>>{{256, 256}, {1024, 256}, {1056, 300}, {1536, 300}, {4352, 512}, {2048, 2048}}) {
+            for (bool perm : {false, true}) {
+                test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, nh, {gqa, 1}, kv_nb.first, kv_nb.second, true, false, 0, 0,
+                    GGML_PREC_F32, type, type, perm ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3}));
+            }
+        }
+    }
     std::default_random_engine rng(0);
 
     // unary ops
@@ -11872,6 +11911,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : { 18432, 67584 }) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {8, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
+    for (int kv : { 2048, 18432, 67584, 133120 }) {
+        test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 4, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext_causal(256, 256, 2, {8, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}));
     }
     // Decode and speculative verification batches at long context depth.
     for (int kv : { 16384, 65536 }) {

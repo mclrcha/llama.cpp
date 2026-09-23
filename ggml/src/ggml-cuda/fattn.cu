@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "fattn-rdna4.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 __launch_bounds__(256, 1)
@@ -735,6 +736,10 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:
+            if (ggml_cuda_flash_attn_ext_rdna4_supported(ggml_cuda_get_device(), dst)) {
+                ggml_cuda_flash_attn_ext_rdna4(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }

@@ -10134,6 +10134,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Dense prefill MMQ: partial row/column tiles, several K tiles, stream-k and non stream-k tile counts.
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
+        for (int64_t n : {33, 128, 300, 2048}) {
+            test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 383, n, 1536, {1, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 1024, 512, 5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32,  128, 256, 17408, {1, 1}, {1, 1}));
+    }
+
     // Dense MTP gate/up fusion: every token count and both equal and mixed types.
     for (ggml_type up_type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS}) {
         for (ggml_type gate_type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS}) {
@@ -11675,6 +11684,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
         }
+    }
+
+    // Qwen3.8-27B dense prefill (ffn up/gate, ffn down, GDN qkv)
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 17408, 2048,  5120, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32,  5120, 2048, 17408, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 10240, 2048,  5120, {1, 1}, {1, 1}));
     }
 
     // Q4_K multi-column mat-vec

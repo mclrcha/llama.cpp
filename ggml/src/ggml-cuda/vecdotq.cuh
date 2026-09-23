@@ -28,6 +28,16 @@ static __device__ __forceinline__ int get_int_b4(const void * x, const int & i32
     return ((const int *) x)[i32]; // assume at least 4 byte alignment
 }
 
+// Per byte a - b for bytes of a in [0, 127] and bytes of b in [0, 128]: result fits int8, no saturation needed.
+// HIP has no packed int8 subtraction, the bias trick keeps each byte from borrowing.
+static __device__ __forceinline__ int ggml_cuda_sub_bytes_nonneg(const int a, const int b) {
+#if defined(GGML_USE_HIP)
+    return ((a | 0x80808080) - b) ^ 0x80808080;
+#else
+    return __vsubss4(a, b);
+#endif // defined(GGML_USE_HIP)
+}
+
 // q4 contains 8 indices with 4 bit each.
 // This function selects those bytes from table that are at those indices and returns them as int2.
 // The first int contains the bytes with even indices in q4, the second int contains the bytes with odd indices in q4.

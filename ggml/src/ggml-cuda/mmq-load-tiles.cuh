@@ -987,11 +987,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         const int kq1 = 2*txi - txi % (QI6_K/2) + QI6_K/2;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-        x_qs[i*sram_stride + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
-        x_qs[i*sram_stride + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+        x_qs[i*sram_stride + kq0] = ggml_cuda_sub_bytes_nonneg(ql0 | qh0, 0x20202020);
+        x_qs[i*sram_stride + kq1] = ggml_cuda_sub_bytes_nonneg(ql1 | qh1, 0x20202020);
 #else
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq0] = ggml_cuda_sub_bytes_nonneg(ql0 | qh0, 0x20202020);
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + kq1] = ggml_cuda_sub_bytes_nonneg(ql1 | qh1, 0x20202020);
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 

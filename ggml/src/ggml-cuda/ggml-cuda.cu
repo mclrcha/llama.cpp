@@ -4321,6 +4321,37 @@ static int ggml_cuda_try_router_pair(ggml_backend_cuda_context &ctx,ggml_cgraph 
     };
     if(overlaps(router,gate)) { return 0; }
     for(const auto *out:{router,gate})for(const auto *in:{x,wr,wg})if(overlaps(out,in)) { return 0; }
+    // the softmax top-k of the router logits runs in the last block of the router kernel (GGML_HIP_ROUTER_TOPK=0 off)
+    static const bool topk_enabled=[] { const char *v=getenv("GGML_HIP_ROUTER_TOPK");return !v || std::atoi(v)!=0; }();
+    ggml_cuda_topk_moe_args args;
+    if(topk_enabled && i+2<graph->n_nodes && graph->nodes[i+2]->op==GGML_OP_SOFT_MAX && graph->nodes[i+2]->src[0]==router &&
+            ggml_cuda_topk_moe_fusion(graph,i+2,args) && !args.delayed_softmax && !args.prob_bias && !args.sigmoid &&
+            !args.sqrt_softplus) {
+        const int j=i+2;
+        std::vector<ggml_op> tops={GGML_OP_SOFT_MAX,GGML_OP_RESHAPE,GGML_OP_ARGSORT,GGML_OP_VIEW,GGML_OP_GET_ROWS};
+        int out_nodes[2]={j+3,0};
+        ggml_tensor *ids=graph->nodes[j+3];
+        const ggml_tensor *clamp=nullptr,*scale=nullptr;
+        if(args.norm) {
+            tops.insert(tops.end(),{GGML_OP_RESHAPE,GGML_OP_SUM_ROWS,GGML_OP_CLAMP,GGML_OP_DIV,GGML_OP_RESHAPE});
+            clamp=graph->nodes[j+tops.size()-3];
+        }
+        if(args.scale) {
+            tops.insert(tops.end(),{GGML_OP_SCALE});
+            scale=graph->nodes[j+tops.size()-1];
+        }
+        ggml_tensor *weights=graph->nodes[j+tops.size()-1];
+        out_nodes[1]=j+int(tops.size())-1;
+        if(j+int(tops.size())<=graph->n_nodes && ids->nb[1]==256*sizeof(int32_t) && ids->ne[1]==n_tokens &&
+                ggml_can_fuse_subgraph(graph,j,tops.size(),tops.data(),out_nodes,2) &&
+                ggml_cuda_should_use_topk_moe(graph->nodes[j],router,weights,ids) &&
+                ggml_cuda_check_fusion_memory_ranges(graph,j,tops.size(),out_nodes,2,/*is_topk_moe=*/true) &&
+                // the gate output must survive the selection writes (ids/weights may alias the logits, as in topk_moe_cuda)
+                !overlaps(ids,gate) && !overlaps(weights,gate) && !overlaps(ids,weights)) {
+            ggml_cuda_router_topk(ctx,router,gate,weights,ids,clamp,scale,args);
+            return 1+int(tops.size());
+        }
+    }
     ggml_cuda_router_pair(ctx,router,gate);
     return 1;
 }

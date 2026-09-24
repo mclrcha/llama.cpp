@@ -2,6 +2,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 #include "mmvf.cuh"
+#include "router-pair.cuh"
 #include "convert.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
@@ -1008,46 +1009,7 @@ void ggml_cuda_gdn_gates_f32(ggml_backend_cuda_context & ctx,
 template <int n_tokens>
 static __global__ void __launch_bounds__(128)
 router_pair_f32(const float * x, const float * y, float * dst, int nrows,const float *gate,float *gate_out) {
-    const int tid = threadIdx.x;
-    const int lane = tid % 32;
-    const int row = blockIdx.x;
-    const float2 * x2 = reinterpret_cast<const float2 *>(row==256 ? gate : x + row * 2048);
-    const float2 * y2 = reinterpret_cast<const float2 *>(y);
-    float sums[2][n_tokens]{};
-    for (int col = tid; col < 1024; col += 256) {
-#pragma unroll
-        for (int group = 0; group < 2; ++group) {
-            const float2 weight = x2[col + group * 128];
-#pragma unroll
-            for (int t = 0; t < n_tokens; ++t) {
-                const float2 input = y2[t * 1024 + col + group * 128];
-                ggml_cuda_mad(sums[group][t], weight.x, input.x);
-                ggml_cuda_mad(sums[group][t], weight.y, input.y);
-            }
-        }
-    }
-    __shared__ float partial[n_tokens][8];
-#pragma unroll
-    for (int group = 0; group < 2; ++group) {
-#pragma unroll
-        for (int t = 0; t < n_tokens; ++t) {
-            sums[group][t] = warp_reduce_sum<32>(sums[group][t]);
-            if (lane == 0) {
-                partial[t][tid / 32 + group * 4] = sums[group][t];
-            }
-        }
-    }
-    __syncthreads();
-    if (tid < 32) {
-#pragma unroll
-        for (int t = 0; t < n_tokens; ++t) {
-            float sum = tid < 8 ? partial[t][tid] : 0.0f;
-            sum = warp_reduce_sum<32>(sum);
-            if (tid == t) {
-                if(row==256) { gate_out[t]=sum; } else { dst[t*nrows+row]=sum; }
-            }
-        }
-    }
+    router_pair_block<n_tokens>(x, y, dst, nrows, gate, gate_out);
 }
 void ggml_cuda_router_pair(ggml_backend_cuda_context &ctx,ggml_tensor *router,ggml_tensor *gate) {
     const ggml_cuda_kernel_launch_params params(dim3(257),dim3(128),0,ctx.stream());

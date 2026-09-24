@@ -1488,8 +1488,14 @@ struct ggml_hip_mmvq_cache {
         return reinterpret_cast<unsigned int *>(static_cast<char *>(data) + nslots*capacity);
     }
 
+    // counters for single-kernel users (e.g. the fused router + top-k), after the group counters
+    static constexpr int nextra = 16;
+    unsigned int * extra_counter(const int k) const {
+        return counters() + ncounters + k;
+    }
+
     static constexpr size_t alloc_size() {
-        return nslots*capacity + ncounters*sizeof(unsigned int);
+        return nslots*capacity + (ncounters + nextra)*sizeof(unsigned int);
     }
 
     // Views and reshapes of the same data share a Q8_1 copy; writes are tracked by address in invalidate_write.

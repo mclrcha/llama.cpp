@@ -597,6 +597,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
                 return 1;
         }
     }
+    // RDNA4, 2..4 columns: two rows per wave reuse the loaded activations. Each row keeps its lane mapping and sum
+    // order, so results are bit-identical (build with -DGGML_HIP_MMVQ_RDNA4_ROWS=1 for the previous kernel).
+#ifndef GGML_HIP_MMVQ_RDNA4_ROWS
+#define GGML_HIP_MMVQ_RDNA4_ROWS 2
+#endif
+    if (table_id == MMVQ_PARAMETERS_RDNA4 && !small_k && ncols_dst >= 2 && ncols_dst <= 4) {
+        return GGML_HIP_MMVQ_RDNA4_ROWS;
+    }
     return 1;
 }
 

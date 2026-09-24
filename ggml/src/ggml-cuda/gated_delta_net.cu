@@ -733,6 +733,15 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float * g_d = (const float *) src_g->data;
     const float * b_d = (const float *) src_beta->data;
 
+#if defined(GGML_USE_HIP)
+    // the graph skipped the state gather of this op (ggml_cuda_gdn_gather_consumer): read the cache row directly
+    if (!gathered) {
+        const auto it = ctx.gdn_deferred_gather.find(dst);
+        if (it != ctx.gdn_deferred_gather.end()) {
+            gathered = it->second;
+        }
+    }
+#endif
     const float * s_d = static_cast<const float *>(gathered ? gathered->src[0]->data : src_state->data);
     const int32_t * state_indices = gathered ? static_cast<const int32_t *>(gathered->src[1]->data) : nullptr;
     const int64_t state_row_stride = gathered ? gathered->src[0]->nb[1] / sizeof(float) : 0;

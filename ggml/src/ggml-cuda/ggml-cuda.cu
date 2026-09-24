@@ -3712,7 +3712,9 @@ static int ggml_cuda_try_rms_pair(ggml_backend_cuda_context & ctx, ggml_cgraph *
 #endif
 
 #if defined(GGML_USE_HIP)
-static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+// moe: the MoE weighted reduction that produces the first addend; its output is then computed inside the fused kernel.
+static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i,
+        const ggml_cuda_moe_weighted_reduction_match * moe = nullptr) {
     static const int mode = [] {
         const char * value = getenv("GGML_HIP_RESIDUAL_RMS");
         return value ? std::atoi(value) : 3;
@@ -3728,8 +3730,22 @@ static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgra
         graph->nodes[i+prefix]->op == GGML_OP_ADD && graph->nodes[i+prefix+1]->op == GGML_OP_ADD &&
         graph->nodes[i+prefix+1]->src[0] == graph->nodes[i+prefix];
     if (gated && !chain) { return 0; }
+    if (moe && !gated) { return 0; }
     auto * gated_mul = gated ? graph->nodes[i+1] : nullptr;
     auto * first = chain ? graph->nodes[i+prefix] : nullptr;
+    if (moe) {
+        // the reduction output is not written: the chain's first addition must be its only consumer
+        if (first->src[0] != moe->dst || moe->expert_scale || moe->dst->ne[0] != first->ne[0] ||
+                moe->dst->ne[1] != first->ne[1] || !ggml_is_contiguous(moe->experts) || !ggml_is_contiguous(moe->weights)) {
+            return 0;
+        }
+        for (int k = i; k < graph->n_nodes; ++k) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                if (graph->nodes[k]->src[s] == moe->dst && graph->nodes[k] != first) { return 0; }
+            }
+        }
+        if (moe->dst->flags & GGML_TENSOR_FLAG_OUTPUT) { return 0; }
+    }
     const int offset = prefix + (chain ? 1 : 0);
     auto * add = graph->nodes[i+offset]; auto * norm = graph->nodes[i+offset+1]; auto * mul = graph->nodes[i+offset+2];
     // Prefill rows use the same kernel (one block per token); GGML_HIP_PREFILL_RESIDUAL_RMS=0 limits it to decode.
@@ -3812,7 +3828,7 @@ static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgra
         return !value || std::atoi(value) != 0;
     }();
     void * mmq_d4 = nullptr, * mmq_ds4 = nullptr;
-    if (mmq_out && !quantized && add->ne[1] >= 64 && ctx.mmvq_cache.enabled) {
+    if (mmq_out && !moe && !quantized && add->ne[1] >= 64 && ctx.mmvq_cache.enabled) {
         const size_t nbytes = size_t(add->ne[1])*(add->ne[0]/128)*144 + 128*144;
         mmq_d4  = ctx.mmq_cache.reserve(0, mul, MMQ_Q8_1_DS_LAYOUT_D4,  nbytes, ctx.stream());
         mmq_ds4 = mmq_d4 ? ctx.mmq_cache.reserve(1, mul, MMQ_Q8_1_DS_LAYOUT_DS4, nbytes, ctx.stream()) : nullptr;
@@ -3821,7 +3837,8 @@ static int ggml_cuda_try_residual_rms(ggml_backend_cuda_context & ctx, ggml_cgra
             mmq_d4 = nullptr;
         }
     }
-    ggml_cuda_op_residual_rms(ctx, add, norm, weight, mul, first, gated_mul, quantized, mmq_d4, mmq_ds4);
+    ggml_cuda_op_residual_rms(ctx, add, norm, weight, mul, first, gated_mul, quantized, mmq_d4, mmq_ds4,
+        moe ? moe->experts : nullptr, moe ? moe->weights : nullptr);
     return 2+offset;
 }
 #endif
@@ -4022,6 +4039,76 @@ static int ggml_cuda_try_gdn_gather(ggml_backend_cuda_context & ctx, ggml_cgraph
 #endif
 
 #if defined(GGML_USE_HIP)
+// Multi-token GATED_DELTA_NET whose initial state is a GET_ROWS of the recurrent cache: returns the op when the gathered
+// rows feed only it, so the gather can be skipped and the op reads the cache row itself (GGML_HIP_GDN_GATHER=0 off).
+static const ggml_tensor * ggml_cuda_gdn_gather_consumer(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph,
+        const ggml_tensor * rows, int start) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_HIP_GDN_GATHER");
+        return !value || std::atoi(value) != 0;
+    }();
+    // only the RDNA4 recurrent kernel (8 lanes per column, 1..4 tokens) has the indexed state read
+    if (!enabled || ctx.curr_stream_no != 0 || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc) ||
+            rows->op != GGML_OP_GET_ROWS || rows->type != GGML_TYPE_F32 || rows->ne[1] != 1 || rows->ne[2] != 1 ||
+            rows->ne[3] != 1 || (rows->flags & GGML_TENSOR_FLAG_OUTPUT)) { return nullptr; }
+    const auto * state = rows->src[0];
+    const auto * ids = rows->src[1];
+    if (state->type != GGML_TYPE_F32 || state->ne[0] != rows->ne[0] || state->ne[2] != 1 || state->ne[3] != 1 ||
+            !ggml_is_contiguous(state) || ids->type != GGML_TYPE_I32 || ggml_nelements(ids) != 1 || !ggml_is_contiguous(ids)) {
+        return nullptr;
+    }
+    const ggml_tensor * gdn = nullptr;
+    int gdn_idx = -1;
+    for (int j = start; j < graph->n_nodes; ++j) {
+        const ggml_tensor * t = graph->nodes[j];
+        const bool is_view = ggml_cuda_is_view_or_noop(t) && t->view_src == rows;
+        if (t->op == GGML_OP_GATED_DELTA_NET && t->src[5] && t->src[5]->view_src == rows && ggml_is_contiguous(t->src[5])) {
+            if (gdn) { return nullptr; }
+            // decide on the shape before scanning the rest of the graph (prefill graphs evaluate this every ubatch)
+            if (t->type != GGML_TYPE_F32 || t->src[3]->ne[0] != 1 || t->src[2]->ne[0] != 128 || t->src[2]->ne[2] < 1 ||
+                    t->src[2]->ne[2] > 4 || t->src[2]->ne[3] != 1 || rows->ne[0] != 128*128*t->src[2]->ne[1]) { return nullptr; }
+            gdn = t;
+            gdn_idx = j;
+            continue;
+        }
+        if (!gdn && j - start > 256) { return nullptr; }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (t->src[s] == rows && !is_view) { return nullptr; }
+            // views of the rows may only feed the op itself
+            if (t->src[s] && t->src[s]->view_src == rows && t->op != GGML_OP_GATED_DELTA_NET && !is_view) { return nullptr; }
+        }
+        // the cache rows must not change before the op reads them
+        if (!gdn && !ggml_cuda_is_view_or_noop(t) && !ggml_is_empty(t) && t->data) {
+            const uintptr_t x = reinterpret_cast<uintptr_t>(t->data), y = reinterpret_cast<uintptr_t>(state->data);
+            if (x < y + ggml_nbytes(state) && y < x + ggml_nbytes(t)) { return nullptr; }
+        }
+    }
+    if (!gdn || gdn->type != GGML_TYPE_F32 || gdn->src[3]->ne[0] != 1 || gdn->src[2]->ne[0] != 128 ||
+            gdn->src[2]->ne[2] < 1 || gdn->src[2]->ne[2] > 4 || gdn->src[2]->ne[3] != 1 ||
+            rows->ne[0] != 128*128*gdn->src[2]->ne[1]) { return nullptr; }
+    for (const auto * t : {state, ids, rows, gdn}) {
+        if (!t->buffer || t->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) { return nullptr; }
+    }
+    const uintptr_t g0 = reinterpret_cast<uintptr_t>(gdn->data), s0 = reinterpret_cast<uintptr_t>(state->data),
+                    i0 = reinterpret_cast<uintptr_t>(ids->data);
+    if ((g0 < s0 + ggml_nbytes(state) && s0 < g0 + ggml_nbytes(gdn)) || (g0 < i0 + ggml_nbytes(ids) && i0 < g0 + ggml_nbytes(gdn))) {
+        return nullptr;
+    }
+    // snapshots written into the cache: each workgroup reads its state columns before writing them, so a written slot may
+    // alias the source row only at a row boundary
+    ggml_cuda_gated_delta_net_fused_cache cache{};
+    if (ggml_cuda_try_gdn_cache_fusion(graph, gdn_idx, cache)) {
+        const size_t bytes = rows->ne[0]*sizeof(float);
+        const int64_t n_written = std::min<int64_t>(gdn->src[2]->ne[2], ggml_get_op_params_i32(gdn, 0));
+        for (int64_t s = 0; s < std::max<int64_t>(n_written, 1); ++s) {
+            const uintptr_t c0 = reinterpret_cast<uintptr_t>(cache.data + s*cache.slot_stride);
+            if (c0 < i0 + ggml_nbytes(ids) && i0 < c0 + bytes) { return nullptr; }
+            if (c0 < s0 + ggml_nbytes(state) && s0 < c0 + bytes && (c0 - s0) % bytes != 0) { return nullptr; }
+        }
+    }
+    return gdn;
+}
+
 static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int i) {
     static const int mode=[] {
         const char *value=getenv("GGML_HIP_CONV_PREPARE");
@@ -4185,6 +4272,11 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
     }
     for(auto *t:independent) {
         if(!ggml_is_empty(t) && (t->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            // the recurrent state gather feeds only a later GATED_DELTA_NET: that op reads the cache row directly
+            if(const ggml_tensor *gdn=ggml_cuda_gdn_gather_consumer(ctx,graph,t,conv_idx)) {
+                ctx.gdn_deferred_gather[gdn]=t;
+                continue;
+            }
             GGML_ASSERT(ggml_cuda_compute_forward(ctx,t));
         }
     }
@@ -4449,6 +4541,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
+#if defined(GGML_USE_HIP)
+            // decode: the following gated residual RMS computes the weighted sum itself (GGML_HIP_MOE_RESIDUAL=0 off)
+            static const bool moe_residual = [] {
+                const char * value = std::getenv("GGML_HIP_MOE_RESIDUAL");
+                return !value || std::atoi(value) != 0;
+            }();
+            if (moe_residual && match.dst->ne[1] <= 4 &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                const int skip = ggml_cuda_try_residual_rms(*cuda_ctx, cgraph, i + match.node_count, &match);
+                if (skip) {
+                    return match.node_count + skip;
+                }
+            }
+#endif
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
@@ -5382,6 +5488,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+#if defined(GGML_USE_HIP)
+                if (node->op == GGML_OP_GET_ROWS) {
+                    if (const ggml_tensor * gdn = ggml_cuda_gdn_gather_consumer(*cuda_ctx, cgraph, node, i + 1)) {
+                        cuda_ctx->gdn_deferred_gather[gdn] = node;
+                        continue;
+                    }
+                }
+#endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
@@ -5462,6 +5576,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     auto & cache = cuda_ctx->mmvq_cache;
     cache.reset();
     cuda_ctx->mmq_cache.reset();
+    cuda_ctx->gdn_deferred_gather.clear();
     cache.enabled = !disable_mmvq_cache && cuda_ctx->stream_context().concurrent_events.empty() &&
                     GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[cuda_ctx->device].cc);
     // The address remains stable for every captured graph on this context.
@@ -5516,6 +5631,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         std::fprintf(stderr, "HIP_GRAPH key=%p tokens=%lld name=%s nodes=%d uid=%llu use=%d capture=%d\n",
             graph_key.first_node, (long long) graph_key.n_tokens, cgraph->nodes[0]->name, cgraph->n_nodes,
             (unsigned long long) cgraph->uid, int(use_cuda_graph), int(cuda_graph_update_required));
+        // GGML_HIP_GRAPH_DIAGNOSTICS=2: also list the nodes (op, type, shape, sources) of each captured graph
+        if (std::atoi(std::getenv("GGML_HIP_GRAPH_DIAGNOSTICS")) == 2 && cuda_graph_update_required) {
+            for (int i = 0; i < cgraph->n_nodes; ++i) {
+                const ggml_tensor * t = cgraph->nodes[i];
+                std::fprintf(stderr, "  node %4d %-14s %-6s [%lld,%lld,%lld,%lld] %-28s <-", i, ggml_op_desc(t), ggml_type_name(t->type),
+                    (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], t->name);
+                for (int j = 0; j < GGML_MAX_SRC && t->src[j]; ++j) {
+                    std::fprintf(stderr, " %s(%s)", t->src[j]->name, ggml_type_name(t->src[j]->type));
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
     }
 #endif
 

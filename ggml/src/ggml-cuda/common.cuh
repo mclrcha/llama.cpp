@@ -1685,6 +1685,9 @@ struct ggml_backend_cuda_context {
 #if defined(GGML_USE_HIP)
     ggml_hip_mmvq_cache mmvq_cache;
     ggml_hip_mmq_cache  mmq_cache;
+    // GATED_DELTA_NET nodes whose initial state gather (GET_ROWS of the recurrent cache) was skipped: the op reads the
+    // state from the cache row instead. Filled and consumed during one graph evaluation.
+    std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_deferred_gather;
 #endif
 
 #ifdef USE_CUDA_GRAPH

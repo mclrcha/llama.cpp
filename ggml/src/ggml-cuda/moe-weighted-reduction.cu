@@ -12,16 +12,8 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
         return;
     }
 
-    const uint64_t first_row   = (uint64_t) token * n_expert_used;
-    const float    first_scale = expert_scale != nullptr ? expert_scale[first_row] : 1.0f;
-    float          sum         = (experts[first_row * n_embd + col] * first_scale) * weights[first_row];
-
-    for (int expert = 1; expert < n_expert_used; ++expert) {
-        const uint64_t row   = first_row + expert;
-        const float   scale = expert_scale != nullptr ? expert_scale[row] : 1.0f;
-        sum += (experts[row * n_embd + col] * scale) * weights[row];
-    }
-    dst[token * n_embd + col] = sum;
+    dst[token * n_embd + col] = moe_weighted_sum(experts, expert_scale, weights, (uint64_t) token * n_expert_used, n_embd, col,
+        n_expert_used);
 }
 
 #if defined(GGML_USE_HIP)

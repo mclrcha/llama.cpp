@@ -1,4 +1,5 @@
 #include "norm.cuh"
+#include "moe-weighted-reduction.cuh"
 #include <cstdint>
 
 template <int block_size>
@@ -781,10 +782,12 @@ struct residual_mmq_block {
 };
 static_assert(sizeof(residual_mmq_block) == 144, "bad residual_mmq_block size");
 
-template<int width, bool chain, bool gated, bool quantize, bool mmq = false>
+// moe_in: a is the weighted sum of the routed experts (moe_weighted_sum of experts/moe_weights), computed here
+template<int width, bool chain, bool gated, bool quantize, bool mmq = false, bool moe_in = false>
 static __global__ void residual_rms_f32(const float * a, const float * b, const float * weight,
                                       float * residual, float * normalized, float eps, const float * c, const float * gate,
-                                      block_q8_1 * quantized, residual_mmq_block * mmq_d4 = nullptr, residual_mmq_block * mmq_ds4 = nullptr) {
+                                      block_q8_1 * quantized, residual_mmq_block * mmq_d4 = nullptr, residual_mmq_block * mmq_ds4 = nullptr,
+                                      const float * experts = nullptr, const float * moe_weights = nullptr, int n_expert_used = 0) {
     const int tid = threadIdx.x, base = blockIdx.x * width;
     float values[width/1024];
     float sum = 0.0f;
@@ -792,12 +795,18 @@ static __global__ void residual_rms_f32(const float * a, const float * b, const 
 #pragma unroll
     for (int j = 0; j < width/1024; ++j) {
         const int col = tid + j*1024;
+        float av;
+        if constexpr (moe_in) {
+            av = moe_weighted_sum(experts, nullptr, moe_weights, (uint64_t) blockIdx.x * n_expert_used, width, col, n_expert_used);
+        } else {
+            av = a[base+col];
+        }
         if constexpr (gated) {
 #pragma clang fp contract(off)
             // HIP __fmul_rn can contract after inlining; preserve the graph's two roundings.
             const float scaled = b[base+col] * factor;
-            values[j] = a[base+col] + scaled;
-        } else { values[j] = a[base+col] + b[base+col]; }
+            values[j] = av + scaled;
+        } else { values[j] = av + b[base+col]; }
         if constexpr (chain) { values[j] += c[base+col]; }
         // Preserve the contraction order of the original RMS loop.
         sum = fmaf(values[j], values[j], sum);
@@ -857,19 +866,29 @@ static __global__ void residual_rms_f32(const float * a, const float * b, const 
 void ggml_cuda_op_residual_rms(ggml_backend_cuda_context & ctx, ggml_tensor * add,
                              const ggml_tensor * norm, const ggml_tensor * weight, ggml_tensor * dst,
                              const ggml_tensor * first, const ggml_tensor * gated_mul, void * quantized,
-                             void * mmq_d4, void * mmq_ds4) {
+                             void * mmq_d4, void * mmq_ds4, const ggml_tensor * moe_experts, const ggml_tensor * moe_weights) {
     float eps; memcpy(&eps, norm->op_params, sizeof(float));
     const ggml_cuda_kernel_launch_params params(dim3(add->ne[1]), dim3(1024), 32*sizeof(float), ctx.stream());
     const auto * input = first ? first : add;
     GGML_ASSERT(!(mmq_d4 || mmq_ds4) || (mmq_d4 && mmq_ds4 && !quantized));
+    GGML_ASSERT(!moe_experts || (gated_mul && first && !mmq_d4));
     const auto launch_q = [&](auto width, auto chain, auto gated, auto q8, auto mmq) {
-        ggml_cuda_kernel_launch(residual_rms_f32<decltype(width)::value, decltype(chain)::value, decltype(gated)::value, decltype(q8)::value,
-                decltype(mmq)::value>, params,
-            static_cast<const float *>(input->src[0]->data), static_cast<const float *>((gated_mul ? gated_mul->src[0] : input->src[1])->data),
-            static_cast<const float *>(weight->data), static_cast<float *>(add->data), static_cast<float *>(dst->data), eps,
-            first ? static_cast<const float *>(add->src[1]->data) : nullptr,
-            gated_mul ? static_cast<const float *>(gated_mul->src[1]->src[0]->data) : nullptr,
-            static_cast<block_q8_1 *>(quantized), static_cast<residual_mmq_block *>(mmq_d4), static_cast<residual_mmq_block *>(mmq_ds4));
+        const auto launch_moe = [&](auto moe_in) {
+            ggml_cuda_kernel_launch(residual_rms_f32<decltype(width)::value, decltype(chain)::value, decltype(gated)::value, decltype(q8)::value,
+                    decltype(mmq)::value, decltype(moe_in)::value>, params,
+                static_cast<const float *>(input->src[0]->data), static_cast<const float *>((gated_mul ? gated_mul->src[0] : input->src[1])->data),
+                static_cast<const float *>(weight->data), static_cast<float *>(add->data), static_cast<float *>(dst->data), eps,
+                first ? static_cast<const float *>(add->src[1]->data) : nullptr,
+                gated_mul ? static_cast<const float *>(gated_mul->src[1]->src[0]->data) : nullptr,
+                static_cast<block_q8_1 *>(quantized), static_cast<residual_mmq_block *>(mmq_d4), static_cast<residual_mmq_block *>(mmq_ds4),
+                moe_experts ? static_cast<const float *>(moe_experts->data) : nullptr,
+                moe_weights ? static_cast<const float *>(moe_weights->data) : nullptr,
+                moe_experts ? int(moe_experts->ne[1]) : 0);
+        };
+        if constexpr (decltype(gated)::value && decltype(chain)::value && !decltype(mmq)::value) {
+            if (moe_experts) { launch_moe(std::true_type{}); return; }
+        }
+        launch_moe(std::false_type{});
     };
     const auto launch = [&](auto width, auto chain, auto gated) {
         if (quantized) { launch_q(width, chain, gated, std::true_type{}, std::false_type{}); }

@@ -5596,8 +5596,11 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 i += match.node_count - 1;
             }
 
-            if (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
-                    cgraph->nodes[i]->op == GGML_OP_ARGSORT) {
+            // GGML_HIP_TOPK_MOE_ALLOC_DEPS=0 restores the pre-#28432 graphs: the fused router reorders f32 reductions,
+            // which can flip near-tie expert choices (MoE KLD ~0.023 vs unfused, same precision)
+            static const bool topk_moe_alloc_deps = getenv("GGML_HIP_TOPK_MOE_ALLOC_DEPS") == nullptr || std::atoi(getenv("GGML_HIP_TOPK_MOE_ALLOC_DEPS"));
+            if (topk_moe_alloc_deps && (cgraph->nodes[i]->op == GGML_OP_UNARY || cgraph->nodes[i]->op == GGML_OP_SOFT_MAX ||
+                    cgraph->nodes[i]->op == GGML_OP_ARGSORT)) {
                 ggml_cuda_topk_moe_args args;
                 const bool              can_fuse = ggml_cuda_topk_moe_fusion(cgraph, i, args);
                 std::vector<ggml_op>    ops;

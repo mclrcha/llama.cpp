@@ -82,6 +82,9 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // top-k candidates (unordered) of output i, when the graph produced them (cparams.logits_topk)
+    bool get_logits_topk_ith(int32_t i, int32_t & k, const llama_token *& ids, const float *& vals);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -228,6 +231,9 @@ private:
 
     void output_reorder();
 
+    // copy the logits still kept on the device (cparams.logits_topk) into the output buffer
+    void logits_lazy_materialize();
+
     // map the output row index `i` to batch index
     int64_t output_resolve_row(int32_t i) const;
 
@@ -344,6 +350,21 @@ private:
     };
 
     std::vector<swap_info> output_swaps;
+
+    // with cparams.logits_topk the logits of the last ubatch stay on the device until requested: rows
+    // [row0, row0 + n) of the output buffer, valid until the next decode
+    struct {
+        bool active = false;
+        ggml_backend_t backend = nullptr;
+        ggml_tensor * t = nullptr;
+        int64_t row0 = 0;
+        int64_t n = 0;
+        std::vector<uint8_t> fetched;
+    } logits_lazy;
+
+    std::vector<llama_token> logits_topk_ids;   // [n_outputs][logits_topk]
+    std::vector<float>       logits_topk_vals;  // [n_outputs][logits_topk]
+    std::vector<uint8_t>     logits_topk_valid; // [n_outputs]
 
     ggml_backend_sched_ptr sched;
 

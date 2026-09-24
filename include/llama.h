@@ -1048,6 +1048,12 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // Top-k candidates of the logits of the ith token (unordered, k of them), computed on the device when the
+    // context keeps the full logits there until requested (LLAMA_LOGITS_TOPK, default 32; 0 disables).
+    // Returns false when not available for this output.
+    LLAMA_API bool llama_get_logits_topk_ith(struct llama_context * ctx, int32_t i, int32_t * k,
+                                             const llama_token ** ids, const float ** vals);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

@@ -118,6 +118,11 @@ llama_context::llama_context(
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
+    {
+        // exact CPU sampling shortcuts only need the top-k logits: 32 candidates per output row, full logits on demand
+        const char * value = getenv("LLAMA_LOGITS_TOPK");
+        cparams.logits_topk = value ? (uint32_t) std::max(0, atoi(value)) : 32;
+    }
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
@@ -908,8 +913,39 @@ enum llama_pooling_type llama_context::pooling_type() const {
 
 float * llama_context::get_logits() {
     output_reorder();
+    logits_lazy_materialize();
 
     return logits.data;
+}
+
+void llama_context::logits_lazy_materialize() {
+    if (!logits_lazy.active) {
+        return;
+    }
+    logits_lazy.active = false;
+    const int64_t n_vocab = model.vocab.n_tokens();
+    ggml_backend_sched_synchronize(sched.get());
+    ggml_backend_tensor_get(logits_lazy.t, logits.data + logits_lazy.row0*n_vocab, 0, logits_lazy.n*n_vocab*sizeof(float));
+}
+
+bool llama_context::get_logits_topk_ith(int32_t i, int32_t & k, const llama_token *& ids, const float *& vals) {
+    output_reorder();
+    if (cparams.logits_topk == 0) {
+        return false;
+    }
+    int64_t j = -1;
+    try {
+        j = output_resolve_row(i);
+    } catch (const std::exception &) {
+        return false;
+    }
+    if (j < 0 || (size_t) j >= logits_topk_valid.size() || !logits_topk_valid[j]) {
+        return false;
+    }
+    k    = (int32_t) cparams.logits_topk;
+    ids  = logits_topk_ids.data()  + j*k;
+    vals = logits_topk_vals.data() + j*k;
+    return true;
 }
 
 int64_t llama_context::output_resolve_row(int32_t i) const {
@@ -950,7 +986,15 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        return logits.data + j*model.vocab.n_tokens();
+        const int64_t n_vocab = model.vocab.n_tokens();
+        if (logits_lazy.active && j >= logits_lazy.row0 && j < logits_lazy.row0 + logits_lazy.n &&
+                !logits_lazy.fetched[j - logits_lazy.row0]) {
+            ggml_backend_sched_synchronize(sched.get());
+            ggml_backend_tensor_get(logits_lazy.t, logits.data + j*n_vocab, (j - logits_lazy.row0)*n_vocab*sizeof(float),
+                n_vocab*sizeof(float));
+            logits_lazy.fetched[j - logits_lazy.row0] = 1;
+        }
+        return logits.data + j*n_vocab;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -1796,6 +1840,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     output_swaps.clear();
+    logits_lazy.active = false;
+    logits_topk_valid.clear();
 
     sched_reserve();
 
@@ -1884,6 +1930,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        // the logits of the previous ubatch live in the compute buffer that this ubatch reuses
+        logits_lazy_materialize();
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
@@ -1941,7 +1990,26 @@ int llama_context::decode(const llama_batch & batch_inp) {
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
                 GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                ggml_tensor * t_ids  = res->t_logits_topk_ids;
+                ggml_tensor * t_vals = res->t_logits_topk_vals;
+                if (t_ids && t_vals && t_ids->ne[1] == n_outputs) {
+                    // copy only the candidates; the full rows are fetched if someone asks for them
+                    const int64_t kt = cparams.logits_topk;
+                    logits_topk_ids.resize(n_outputs_all*kt);
+                    logits_topk_vals.resize(n_outputs_all*kt);
+                    logits_topk_valid.resize(n_outputs_all, 0);
+                    ggml_backend_tensor_get_async(backend_res, t_ids,  logits_topk_ids.data()  + n_outputs_prev*kt, 0, n_outputs*kt*sizeof(int32_t));
+                    ggml_backend_tensor_get_async(backend_res, t_vals, logits_topk_vals.data() + n_outputs_prev*kt, 0, n_outputs*kt*sizeof(float));
+                    std::fill(logits_topk_valid.begin() + n_outputs_prev, logits_topk_valid.begin() + n_outputs_prev + n_outputs, 1);
+                    logits_lazy.active  = true;
+                    logits_lazy.backend = backend_res;
+                    logits_lazy.t       = t_logits;
+                    logits_lazy.row0    = n_outputs_prev;
+                    logits_lazy.n       = n_outputs;
+                    logits_lazy.fetched.assign(n_outputs, 0);
+                } else {
+                    ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                }
             }
         }
 
@@ -2295,6 +2363,10 @@ void llama_context::output_reorder() {
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
+    if (!output_swaps.empty()) {
+        logits_lazy_materialize();
+    }
+
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
@@ -2309,6 +2381,15 @@ void llama_context::output_reorder() {
             for (uint64_t k = 0; k < n_embd_out; k++) {
                 std::swap(embd.data[i0*n_embd_out + k], embd.data[i1*n_embd_out + k]);
             }
+        }
+
+        if (!logits_topk_valid.empty()) {
+            const uint64_t kt = cparams.logits_topk;
+            for (uint64_t k = 0; k < kt; k++) {
+                std::swap(logits_topk_ids [i0*kt + k], logits_topk_ids [i1*kt + k]);
+                std::swap(logits_topk_vals[i0*kt + k], logits_topk_vals[i1*kt + k]);
+            }
+            std::swap(logits_topk_valid[i0], logits_topk_valid[i1]);
         }
 
         if (embd_nextn.size > 0) {
@@ -3947,6 +4028,21 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+bool llama_get_logits_topk_ith(llama_context * ctx, int32_t i, int32_t * k, const llama_token ** ids, const float ** vals) {
+    ctx->synchronize();
+
+    int32_t kk = 0;
+    const llama_token * ii = nullptr;
+    const float * vv = nullptr;
+    if (!ctx->get_logits_topk_ith(i, kk, ii, vv)) {
+        return false;
+    }
+    *k = kk;
+    *ids = ii;
+    *vals = vv;
+    return true;
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

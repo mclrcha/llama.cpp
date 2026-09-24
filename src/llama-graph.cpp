@@ -1326,6 +1326,8 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_logits_topk_ids  = nullptr;
+    t_logits_topk_vals = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -3800,6 +3802,23 @@ void llm_graph_context::build_pooling(
     res->t_embd_pooled = cur;
 
     ggml_build_forward_expand(gf, cur);
+}
+
+void llm_graph_context::build_logits_topk() const {
+    const int64_t k = cparams.logits_topk;
+    ggml_tensor * logits = res->t_logits;
+    if (k <= 0 || !samplers.empty() || !logits || logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
+            logits->ne[1] < 1 || logits->ne[1] > 8 || logits->ne[2] != 1 || logits->ne[3] != 1 || logits->ne[0] < 4*k) {
+        return;
+    }
+    ggml_tensor * ids = ggml_top_k(ctx0, logits, k);
+    ggml_set_name(ids, "logits_topk_ids");
+    ggml_tensor * vals = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], logits->ne[1]), ids);
+    ggml_set_name(vals, "logits_topk_vals");
+    ggml_build_forward_expand(gf, ids);
+    ggml_build_forward_expand(gf, vals);
+    res->t_logits_topk_ids  = ids;
+    res->t_logits_topk_vals = vals;
 }
 
 void llm_graph_context::build_sampling() const {

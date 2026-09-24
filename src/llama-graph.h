@@ -936,6 +936,8 @@ public:
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
+    ggml_tensor * t_logits_topk_ids  = nullptr; // [logits_topk, n_outputs] I32, unordered
+    ggml_tensor * t_logits_topk_vals = nullptr; // [1, logits_topk, n_outputs] F32, logits of the ids
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -1383,6 +1385,9 @@ struct llm_graph_context {
     //
 
     void build_sampling() const;
+
+    // top-k candidates of the logits for CPU samplers (cparams.logits_topk)
+    void build_logits_topk() const;
 
     //
     // dense (out)

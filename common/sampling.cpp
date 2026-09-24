@@ -643,10 +643,6 @@ static bool common_sampler_fast_candidates(struct common_sampler * gsmpl, struct
             llama_get_sampled_token_ith(ctx, idx) != LLAMA_TOKEN_NULL) {
         return false;
     }
-    const float * logits = llama_get_logits_ith(ctx, idx);
-    if (!logits) {
-        return false;
-    }
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     const int n_vocab = llama_vocab_n_tokens(vocab);
     const int k = std::min<int>(p.top_k, n_vocab);
@@ -662,6 +658,48 @@ static bool common_sampler_fast_candidates(struct common_sampler * gsmpl, struct
     const auto is_suppressed = [&](llama_token id) {
         return !suppressed.empty() && std::binary_search(suppressed.begin(), suppressed.end(), id);
     };
+
+    auto & cur = gsmpl->cur;
+
+    // device top-k candidates: the best non-suppressed of them are the best of the vocabulary. When their k+1 best are
+    // distinct, the top-k (and its order) is unique and the chain gives the same result as on the full array.
+    {
+        int32_t n_cand = 0;
+        const llama_token * cand_ids = nullptr;
+        const float * cand_vals = nullptr;
+        if (llama_get_logits_topk_ith(ctx, idx, &n_cand, &cand_ids, &cand_vals)) {
+            static thread_local std::vector<llama_token_data> cand;
+            cand.clear();
+            for (int32_t i = 0; i < n_cand; ++i) {
+                if (!is_suppressed(cand_ids[i])) {
+                    cand.push_back(llama_token_data{cand_ids[i], cand_vals[i], 0.0f});
+                }
+            }
+            if ((int) cand.size() >= k + 1) {
+                std::sort(cand.begin(), cand.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                    return a.logit > b.logit;
+                });
+                bool unique = std::isfinite(cand[k].logit);
+                for (int i = 1; unique && i <= k; ++i) {
+                    unique = cand[i-1].logit > cand[i].logit;
+                }
+                if (unique) {
+                    // the k+1 best (a superset of the top-k, like the scan below), in vocabulary order
+                    cur.assign(cand.begin(), cand.begin() + k + 1);
+                    std::sort(cur.begin(), cur.end(), [](const llama_token_data & a, const llama_token_data & b) {
+                        return a.id < b.id;
+                    });
+                    gsmpl->cur_p = { cur.data(), cur.size(), -1, false };
+                    return true;
+                }
+            }
+        }
+    }
+
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    if (!logits) {
+        return false;
+    }
 
     // the k-th largest block maximum is a lower bound of the k-th largest logit
     constexpr int block = 256;
@@ -716,7 +754,6 @@ static bool common_sampler_fast_candidates(struct common_sampler * gsmpl, struct
     }
 
     // only blocks whose maximum reaches the threshold can hold candidates
-    auto & cur = gsmpl->cur;
     cur.clear();
     for (int b = 0; b < n_blocks; ++b) {
         if (!(maxima[b] >= threshold)) {

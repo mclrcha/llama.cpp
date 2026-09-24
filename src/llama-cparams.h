@@ -21,6 +21,9 @@ struct llama_cparams {
 
     int32_t  nextn_layer_offset = 0;
 
+    // > 0: logits graphs also produce the top-k candidates, full logits are fetched on demand
+    uint32_t logits_topk = 0;
+
     float rope_freq_base;
     float rope_freq_scale;
 

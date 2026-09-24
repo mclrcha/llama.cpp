@@ -3807,7 +3807,8 @@ void llm_graph_context::build_pooling(
 void llm_graph_context::build_logits_topk() const {
     const int64_t k = cparams.logits_topk;
     ggml_tensor * logits = res->t_logits;
-    if (k <= 0 || !samplers.empty() || !logits || logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
+    // decode and speculative verification batches only: in prompt ubatches the extra nodes cost more than the copy they save
+    if (k <= 0 || n_tokens > 8 || !samplers.empty() || !logits || logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
             logits->ne[1] < 1 || logits->ne[1] > 8 || logits->ne[2] != 1 || logits->ne[3] != 1 || logits->ne[0] < 4*k) {
         return;
     }

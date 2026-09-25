@@ -1531,6 +1531,16 @@ ggml_tensor * llm_graph_context::build_draft_lm_head(
     ggml_tensor * w_sub  = ggml_view_2d(ctx0, w, w->ne[0], draft_vocab, w->nb[1], 0);
     ggml_tensor * logits = ggml_mul_mat(ctx0, w_sub, cur);
 
+    // Backend samplers only see the scored rows: the -inf rest never enters a top-k and adds 0 to a softmax, and the
+    // host never reads raw logits. Skips building and copying the -inf block (LLAMA_MTP_DRAFT_FULL_ROW=1 keeps it).
+    static const bool full_row = [] {
+        const char * value = getenv("LLAMA_MTP_DRAFT_FULL_ROW");
+        return value && std::atoi(value) != 0;
+    }();
+    if (!full_row && !samplers.empty()) {
+        return logits;
+    }
+
     ggml_tensor * rest = ggml_arange(ctx0, 0.0f, (float) (n_vocab_w - draft_vocab), 1.0f);
     rest = ggml_scale_bias(ctx0, rest, 0.0f, -INFINITY);
     rest = ggml_repeat_4d(ctx0, rest, n_vocab_w - draft_vocab, cur->ne[1], 1, 1);

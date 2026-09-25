@@ -402,17 +402,13 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
         uint32_t new_head = cells.size();
 
-        // cells past the last used one are empty and never match: stop there (the cache can be much larger)
-        const uint32_t n_scan = cells.used_max_p1();
-        for (uint32_t i = 0; i < n_scan; ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
+        // the position index lists exactly the cells of the sequence in [p0, p1): no scan of the whole cache
+        // (a draft rollback removes a few cells at the end of a long context)
+        std::vector<uint32_t> idxs;
+        cells.seq_cells_in(seq_id, p0, p1, idxs);
+        for (const uint32_t i : idxs) {
+            if (cells.seq_rm(i, seq_id)) {
+                new_head = std::min(new_head, i);
             }
         }
 
@@ -1737,6 +1733,62 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data
     }
 }
 
+// One sequence, causal, no SWA/ALiBi: every non-empty cell belongs to the sequence, so a cell is kept iff its position
+// is <= the token's (M-RoPE: plus the 2D check at equal positions), the same values as the generic path. The first
+// token scans only the positions; the others copy its row and redo the cells at or after the batch's first position.
+template<typename T>
+static void set_input_kq_mask_single_seq(const llama_kv_cells & cells, const llama_ubatch * ubatch, int64_t n_kv, T * data) {
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
+    const llama_pos * pos = cells.pos_data();
+    const bool is_2d = ubatch->is_pos_2d();
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    llama_pos pos_min = INT32_MAX;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        pos_min = std::min(pos_min, ubatch->pos[i]);
+    }
+
+    const auto keep = [&](uint32_t i, int64_t j) {
+        const llama_pos p0 = pos[j];
+        const llama_pos p1 = ubatch->pos[i];
+        if (p0 < 0 || p0 > p1) {
+            return false;
+        }
+        if (is_2d && p0 == p1) {
+            const llama_pos p1_x = ubatch->pos[i + n_tokens*2];
+            const llama_pos p1_y = ubatch->pos[i + n_tokens];
+            if (cells.ext_get(j).is_2d_gt(p1_x, p1_y)) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::vector<uint32_t> tail;
+    {
+        T * row = data;
+        const llama_pos p1 = ubatch->pos[0];
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const llama_pos p0 = pos[j];
+            row[j] = p0 >= 0 && p0 < p1 ? mask_keep : mask_drop;
+            if (p0 >= pos_min) {
+                tail.push_back((uint32_t) j);
+            }
+        }
+        for (const uint32_t j : tail) {
+            row[j] = keep(0, j) ? mask_keep : mask_drop;
+        }
+    }
+    for (uint32_t i = 1; i < n_tokens; ++i) {
+        T * row = data + n_kv*i;
+        std::copy(data, data + n_kv, row);
+        for (const uint32_t j : tail) {
+            row[j] = keep(i, j) ? mask_keep : mask_drop;
+        }
+    }
+}
+
 template<typename T>
 static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, T * data, bool causal_attn) {
     if (causal_attn) {
@@ -1778,6 +1830,20 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_stream         =*/ n_stream,
         /*.n_tps            =*/ n_tps,
     };
+
+    static const bool fast_single_seq = [] {
+        const char * value = getenv("LLAMA_KQ_MASK_FAST");
+        return !value || atoi(value) != 0;
+    }();
+    if (fast_single_seq && n_seq_max == 1 && n_stream == 1 && causal_attn && swa_type == LLAMA_SWA_TYPE_NONE &&
+            !hparams.use_alibi && (int64_t) v_cells[0].size() >= n_kv) {
+        if (dst->type == GGML_TYPE_F16) {
+            set_input_kq_mask_single_seq<ggml_fp16_t>(v_cells[0], ubatch, n_kv, (ggml_fp16_t *) dst->data);
+        } else {
+            set_input_kq_mask_single_seq<float>(v_cells[0], ubatch, n_kv, (float *) dst->data);
+        }
+        return;
+    }
 
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);

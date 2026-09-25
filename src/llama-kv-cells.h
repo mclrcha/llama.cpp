@@ -386,6 +386,24 @@ public:
         return seq_pos[seq_id].rbegin()->first;
     }
 
+    // the cells of sequence seq_id with position in [p0, p1), in position order
+    void seq_cells_in(llama_seq_id seq_id, llama_pos p0, llama_pos p1, std::vector<uint32_t> & res) const {
+        assert(seq_id >= 0);
+        assert(seq_id < LLAMA_MAX_SEQ);
+
+        res.clear();
+
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p0, 0 }); it != sp.end() && it->first < p1; ++it) {
+            res.push_back(it->second);
+        }
+    }
+
+    // positions of all cells (-1 for empty cells)
+    const llama_pos * pos_data() const {
+        return pos.data();
+    }
+
     // note: call only if the cell is not empty
     llama_pos pos_get(uint32_t i) const {
         assert(i < pos.size());

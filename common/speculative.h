@@ -73,6 +73,9 @@ struct common_speculative_draft_params {
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
 
+// whether any implementation reads the draft params prompt (otherwise the caller may leave it empty)
+bool common_speculative_uses_prompt(const common_speculative * spec);
+
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 

@@ -3023,7 +3023,12 @@ private:
                             slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        // copying a long prompt every step is measurable; skip it when no implementation reads it
+                        if (common_speculative_uses_prompt(spec.get())) {
+                            slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
+                        } else {
+                            slot.spec_prompt.clear();
+                        }
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,

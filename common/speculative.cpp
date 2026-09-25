@@ -171,12 +171,17 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // whether draft() reads common_speculative_draft_params::prompt (the draft-model implementations do not)
+    virtual bool uses_prompt() const { return true; }
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
+    bool uses_prompt() const override { return false; }
+
     common_params_speculative_draft params;
 
     llama_batch batch;
@@ -424,6 +429,8 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
 //      in verify mode, have process() only stash features and let draft() seed run
 //      encoder+decoder on n_accepted+1 rows).
 struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
+    bool uses_prompt() const override { return false; }
+
     common_params_speculative_draft params;
     llama_batch batch;
 
@@ -908,6 +915,8 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
 
 // DFlash: block-diffusion drafting with a draft-side KV cache injection
 struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+    bool uses_prompt() const override { return false; }
+
     common_params_speculative_draft params;
 
     llama_batch batch;        // noise tokens
@@ -1328,6 +1337,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 };
 
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+    bool uses_prompt() const override { return false; }
+
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
     llama_batch batch;
@@ -2366,6 +2377,20 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
     }
 
     return n_max;
+}
+
+bool common_speculative_uses_prompt(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    for (const auto & impl : spec->impls) {
+        if (impl->uses_prompt()) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 int32_t common_speculative_n_max(const common_speculative * spec) {

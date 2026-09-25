@@ -976,6 +976,47 @@ static void test_compat(testing & t) {
         t.assert_true("both kept", batch.token != nullptr && batch.embd != nullptr);
     });
 
+    t.test("token_and_embd_borrowed", [&](testing & t) {
+        // llama_decode path: the embd rows of the llama_batch are referenced, not copied
+        llama_token token[3] = { 5, 6, 7 };
+        float       embd[6]  = { 0, 1, 100, 101, 200, 201 };
+        llama_pos   pos[3]   = { 3, 4, 5 };
+
+        llama_batch lb = {};
+        lb.n_tokens = 3;
+        lb.token    = token;
+        lb.embd     = embd;
+        lb.pos      = pos;
+
+        batch_builder bb(2, nullptr, 4, 1, /*n_vocab*/ 100);
+        llama_batch_compat::init(bb.b, lb, 0, /*borrow_embd =*/ true);
+
+        t.assert_true("nothing copied", bb.b.embd.empty() && bb.b.embd_data() == embd);
+        t.assert_equal((size_t) 2, bb.b.n_embd);
+        for (int i = 0; i < 3; ++i) {
+            t.assert_equal(token[i], bb.b.tokens[i].id);
+            t.assert_true(bb.b.tokens[i].has_embd);
+            t.assert_equal((size_t) i*2, bb.b.tokens[i].embd_off);
+        }
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        t.assert_true("allocr references the rows", ba.get_batch().embd == embd);
+        llama_ubatch ub = ba.split_simple(3);
+        t.assert_equal(3u, ub.n_tokens);
+        for (int i = 0; i < 3; ++i) {
+            t.assert_equal(token[i], ub.token[i]);
+            t.assert_equal(embd[2*i],     ub.embd[2*i]);
+            t.assert_equal(embd[2*i + 1], ub.embd[2*i + 1]);
+        }
+
+        const int32_t idx = bb.b.add_token(0);
+        llama_embd row = { embd, 1, 2 };
+        t.assert_true("no owned rows on a borrowed batch", idx >= 0 && !bb.b.set_token_embd(idx, row));
+
+        bb.b.clear();
+        t.assert_true("clear drops the borrowed rows", bb.b.embd_borrowed == nullptr);
+    });
+
     t.test("embd_row_width_override", [&](testing & t) {
         // encoder input (e.g. eagle3/dflash) is wider than the decoder input
         const uint32_t n_embd_enc = 6;

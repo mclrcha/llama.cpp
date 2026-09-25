@@ -4437,12 +4437,13 @@ size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, lla
 // compat: llama_batch -> llama_batch_ext -> encode/decode
 
 int llama_context::encode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp, model.hparams.n_embd_inp_enc());
+    // batch_inp outlives the call, so its embeddings are referenced instead of copied
+    llama_batch_compat compat(this, batch_inp, model.hparams.n_embd_inp_enc(), /*borrow_embd =*/ true);
     return encode(*compat.batch_ext);
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
-    llama_batch_compat compat(this, batch_inp);
+    llama_batch_compat compat(this, batch_inp, 0, /*borrow_embd =*/ true);
     return decode(*compat.batch_ext);
 }
 

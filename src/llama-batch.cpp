@@ -84,10 +84,6 @@ bool llama_batch_allocr::init(
         }
     }
 
-    if (has_embd) {
-        embd_vec = batch_inp.embd;
-    }
-
     //
     // build flat pos array
     // token batch:     pos[i]            = tokens[i].pos[0]
@@ -174,7 +170,7 @@ bool llama_batch_allocr::init(
 
     batch.n_tokens = n_tok;
     batch.token    = has_token ? token_vec.data() : nullptr;
-    batch.embd     = has_embd  ? embd_vec.data()  : nullptr;
+    batch.embd     = has_embd  ? const_cast<float *>(batch_inp.embd_data()) : nullptr;
     batch.pos      = pos.data();
     batch.n_seq_id = n_seq_id.data();
     batch.seq_id   = seq_id.data();
@@ -758,7 +754,6 @@ void llama_batch_allocr::clear() {
     batch = {};
 
     token_vec   .clear();
-    embd_vec    .clear();
     seq_id_data .clear();
     pos         .clear();
     n_seq_id    .clear();
@@ -1066,6 +1061,7 @@ llama_batch_ext::llama_batch_ext(
 void llama_batch_ext::clear() {
     tokens.clear();
     embd  .clear();
+    embd_borrowed = nullptr;
     n_embd = 0;
 }
 
@@ -1138,6 +1134,10 @@ bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
 
     if (t.has_embd) {
         LLAMA_LOG_ERROR("%s: embedding for token %d is already set\n", __func__, idx);
+        return false;
+    }
+    if (embd_borrowed) {
+        LLAMA_LOG_ERROR("%s: cannot mix owned and borrowed embeddings\n", __func__);
         return false;
     }
 
@@ -1244,7 +1244,7 @@ bool llama_batch_ext_set_output_logits(llama_batch_ext * batch, int32_t idx, boo
 
 // llama_batch_compat
 
-void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row) {
+void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_inp, size_t n_embd_row, bool borrow_embd) {
     llama_batch_ext * batch_ext = &dst;
 
     if (n_embd_row == 0) {
@@ -1259,9 +1259,22 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
     static const int32_t      default_n_seq_id  = 1;
 
     // auto-generates positions locally when batch_inp.pos is null, continuing from memory
-    std::vector<llama_pos> pos_next(batch_ext->n_seq_max);
-    for (llama_seq_id s = 0; s < (llama_seq_id) batch_ext->n_seq_max; ++s) {
-        pos_next[s] = llama_memory_seq_pos_max(batch_ext->mem, s) + 1; // assume next pos
+    std::vector<llama_pos> pos_next;
+    if (!batch_inp.pos) {
+        pos_next.resize(batch_ext->n_seq_max);
+        for (llama_seq_id s = 0; s < (llama_seq_id) batch_ext->n_seq_max; ++s) {
+            pos_next[s] = llama_memory_seq_pos_max(batch_ext->mem, s) + 1; // assume next pos
+        }
+    }
+
+    batch_ext->tokens.reserve(batch_ext->tokens.size() + batch_inp.n_tokens);
+    if (has_embd) {
+        if (borrow_embd) {
+            GGML_ASSERT(batch_ext->embd.empty() && batch_ext->tokens.empty());
+            batch_ext->embd_borrowed = batch_inp.embd;
+        } else {
+            batch_ext->embd.reserve(batch_ext->embd.size() + (size_t) batch_inp.n_tokens * n_embd_row);
+        }
     }
 
     for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
@@ -1298,9 +1311,13 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
 
         if (has_embd) {
             t.has_embd = true;
-            t.embd_off = batch_ext->embd.size();
-            const float * src = batch_inp.embd + (size_t) i * n_embd_row;
-            batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
+            if (borrow_embd) {
+                t.embd_off = (size_t) i * n_embd_row;
+            } else {
+                t.embd_off = batch_ext->embd.size();
+                const float * src = batch_inp.embd + (size_t) i * n_embd_row;
+                batch_ext->embd.insert(batch_ext->embd.end(), src, src + n_embd_row);
+            }
             batch_ext->n_embd = n_embd_row;
         }
 
@@ -1310,13 +1327,13 @@ void llama_batch_compat::init(llama_batch_ext & dst, const llama_batch & batch_i
             ? (batch_inp.logits[i] != 0)
             : (i == batch_inp.n_tokens - 1);
 
-        batch_ext->tokens.push_back(t);
+        batch_ext->tokens.push_back(std::move(t));
     }
 }
 
-llama_batch_compat::llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row) {
+llama_batch_compat::llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row, bool borrow_embd) {
     batch_ext = new llama_batch_ext(ctx);
-    init(*batch_ext, batch_inp, n_embd_row);
+    init(*batch_ext, batch_inp, n_embd_row, borrow_embd);
 }
 
 llama_batch_compat::~llama_batch_compat() {

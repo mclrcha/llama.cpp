@@ -101,6 +101,12 @@ struct llama_batch_ext {
     std::vector<token> tokens;
     std::vector<float> embd;
 
+    // non-owning embd rows used instead of `embd` when set (llama_batch_compat with borrow_embd)
+    // they must stay valid until the batch is decoded
+    const float * embd_borrowed = nullptr;
+
+    const float * embd_data() const { return embd_borrowed ? embd_borrowed : embd.data(); }
+
     llama_batch_ext(llama_context * ctx);
 
     // build without a llama_context, used by tests
@@ -132,6 +138,7 @@ public:
     llama_batch_allocr(uint32_t n_pos_per_embd);
 
     // convert a llama_batch_ext to internal llama_batch and sanitize it
+    // the embeddings are not copied: batch_inp must stay alive until the batch is split
     bool init(
             const llama_batch_ext & batch_inp,
             const llama_vocab & vocab,
@@ -192,7 +199,6 @@ private:
     uint32_t n_outputs;
 
     std::vector<llama_token>    token_vec;    // owned token IDs built from llama_batch_ext
-    std::vector<float>          embd_vec;     // owned embeddings built from llama_batch_ext
     std::vector<llama_seq_id>   seq_id_data;  // flat storage for seq_id pointers below
 
     std::vector<llama_pos>      pos;
@@ -234,10 +240,11 @@ struct llama_batch_compat {
     llama_batch_ext * batch_ext;
 
     // n_embd_row is the embd row width of batch_inp, 0 = use the decoder width
-    llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row = 0);
+    // borrow_embd: reference the embd rows of batch_inp instead of copying them, batch_inp must outlive the decode
+    llama_batch_compat(llama_context * ctx, const llama_batch & batch_inp, size_t n_embd_row = 0, bool borrow_embd = false);
     ~llama_batch_compat();
 
     // fill an existing llama_batch_ext from a llama_batch (old API)
     // note: this is called directly by the tests, skipping llama_context creation
-    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0);
+    static void init(llama_batch_ext & batch_ext, const llama_batch & batch_inp, size_t n_embd_row = 0, bool borrow_embd = false);
 };

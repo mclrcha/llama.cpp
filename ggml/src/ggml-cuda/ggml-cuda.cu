@@ -3519,6 +3519,34 @@ static int ggml_cuda_try_concat_copy_batch(ggml_backend_cuda_context & ctx, cons
 #endif
 
 #if defined(GGML_USE_HIP)
+// Structure of the GDN gate nodes fused by ggml_cuda_try_gdn_gates (both node orders): returns the shared input and the
+// two outputs. graph_optimize keeps the input alive until the outputs are written so that the kernel writes them directly.
+static bool ggml_cuda_gdn_gates_nodes(const ggml_cgraph * graph, int i, const ggml_tensor *& x, const ggml_tensor *& gate_out,
+        const ggml_tensor *& beta_out) {
+    static const ggml_op patterns[2][9] = {
+        {GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
+         GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY},
+        {GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY, GGML_OP_MUL_MAT,
+         GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_NONE},
+    };
+    static const int positions[2][10] = {{0,6,1,7,2,3,4,5,8,9}, {3,0,4,1,5,6,7,7,2,8}};
+    for (int p = 0; p < 2; ++p) {
+        const auto & pos = positions[p];
+        if (i + pos[9] > graph->n_nodes) { continue; }
+        bool match = true;
+        for (int j = 0; j < pos[9] && match; ++j) { match = graph->nodes[i+j]->op == patterns[p][j]; }
+        if (!match) { continue; }
+        const ggml_tensor * alpha = graph->nodes[i+pos[0]];
+        const ggml_tensor * beta  = graph->nodes[i+pos[1]];
+        if (alpha->src[1] != beta->src[1]) { continue; }
+        x = alpha->src[1];
+        gate_out = graph->nodes[i+pos[7]];
+        beta_out = graph->nodes[i+pos[8]];
+        return true;
+    }
+    return false;
+}
+
 static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const int mode = [] {
         const char * value = getenv("GGML_HIP_GDN_GATES");
@@ -4243,20 +4271,28 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
     const ggml_tensor *qnorm=nullptr;
     ggml_tensor *qout=nullptr,*kout=nullptr;
     int last=conv_idx+1;
-    if(n_tokens==1 && mode>=2 && conv_idx+7<graph->n_nodes) {
+    // Q/K RMS norm + scale in the same kernel; several tokens (speculative verification) with GGML_HIP_CONV_PREPARE_QK=0 off
+    static const bool qk_batch=[] { const char *v=getenv("GGML_HIP_CONV_PREPARE_QK");return !v || std::atoi(v)!=0; }();
+    if((n_tokens==1 || qk_batch) && mode>=2 && conv_idx+7<graph->n_nodes) {
         auto *qview=graph->nodes[conv_idx+2];auto *qn=graph->nodes[conv_idx+3];auto *qs=graph->nodes[conv_idx+4];
         auto *kview=graph->nodes[conv_idx+5];auto *kn=graph->nodes[conv_idx+6];auto *ks=graph->nodes[conv_idx+7];
+        const size_t q_bytes=qview->op==GGML_OP_VIEW ? size_t(128)*qview->ne[1]*sizeof(float) : 0;
         bool valid=qview->op==GGML_OP_VIEW && qview->view_src==silu && qview->view_offs==0 &&
-            kview->op==GGML_OP_VIEW && kview->view_src==silu && kview->view_offs==ggml_nbytes(qview) &&
+            kview->op==GGML_OP_VIEW && kview->view_src==silu && kview->view_offs==q_bytes &&
             qn->op==GGML_OP_RMS_NORM && kn->op==GGML_OP_RMS_NORM && qn->src[0]==qview && kn->src[0]==kview &&
             qs->op==GGML_OP_SCALE && ks->op==GGML_OP_SCALE && qs->src[0]==qn && ks->src[0]==kn &&
-            qview->ne[0]==128 && qview->ne[1]>0 && qview->ne[2]==1 && qview->ne[3]==1 &&
+            qview->ne[0]==128 && qview->ne[1]>0 && qview->ne[2]==n_tokens && qview->ne[3]==1 &&
             ggml_are_same_shape(qview,kview) && ggml_are_same_shape(qview,qs) && ggml_are_same_shape(qview,ks) &&
-            2*ggml_nelements(qview)<=concat->ne[1] &&
+            2*128*qview->ne[1]<=concat->ne[1] &&
             memcmp(qn->op_params,kn->op_params,sizeof(float))==0 &&
             memcmp(qs->op_params,ks->op_params,2*sizeof(float))==0;
+        for(const auto *t:{qview,kview}) {
+            // [128, heads, tokens] views of the [channels, tokens] convolution output
+            valid=valid && t->nb[0]==sizeof(float) && t->nb[1]==128*sizeof(float) &&
+                (n_tokens==1 || t->nb[2]==size_t(concat->ne[1])*sizeof(float));
+        }
         for(const auto *t:{qview,qn,qs,kview,kn,ks}) {
-            valid=valid && t->type==GGML_TYPE_F32 && ggml_is_contiguous(t) && t->buffer &&
+            valid=valid && t->type==GGML_TYPE_F32 && (t==qview || t==kview || ggml_is_contiguous(t)) && t->buffer &&
                 t->buffer->buft==ggml_backend_cuda_buffer_type(ctx.device);
         }
         for(const auto *out:{qs,ks}) {
@@ -5759,6 +5795,20 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                 i += match.node_count - 1;
             }
 
+#if defined(GGML_USE_HIP)
+            {
+                static const bool gates_deps = [] {
+                    const char * value = std::getenv("GGML_HIP_GDN_GATES_ALLOC_DEPS");
+                    return !value || std::atoi(value) != 0;
+                }();
+                const ggml_tensor * x = nullptr, * gate_out = nullptr, * beta_out = nullptr;
+                if (gates_deps && cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->ne[1] <= 4 &&
+                        ggml_cuda_gdn_gates_nodes(cgraph, i, x, gate_out, beta_out)) {
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x), const_cast<ggml_tensor *>(gate_out));
+                    params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x), const_cast<ggml_tensor *>(beta_out));
+                }
+            }
+#endif
             // GGML_HIP_TOPK_MOE_ALLOC_DEPS=0 restores the pre-#28432 graphs: the fused router reorders f32 reductions,
             // which can flip near-tie expert choices (MoE KLD ~0.023 vs unfused, same precision)
             static const bool topk_moe_alloc_deps = getenv("GGML_HIP_TOPK_MOE_ALLOC_DEPS") == nullptr || std::atoi(getenv("GGML_HIP_TOPK_MOE_ALLOC_DEPS"));

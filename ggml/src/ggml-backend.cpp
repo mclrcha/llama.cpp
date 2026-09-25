@@ -1912,6 +1912,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    // ggml_backend_sched_reset only clears the slots used since the previous reset
+    memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
+    memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
     const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
@@ -1986,9 +1989,21 @@ void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     // reset state for the next run
     if (!sched->is_reset) {
+        // every write to the per-tensor arrays goes through ggml_hash_find_or_insert, which marks the slot as used:
+        // only the used slots need clearing (the table is sized for the largest graph of the model, often much larger
+        // than the graph that just ran)
+        const size_t n_slot_copies = (size_t) sched->n_backends * sched->n_copies;
+        const size_t n_words = ggml_bitset_size(sched->hash_set.size);
+        for (size_t w = 0; w < n_words; ++w) {
+            ggml_bitset_t bits = sched->hash_set.used[w];
+            while (bits) {
+                const size_t i = (w << BITSET_SHR) + (size_t) __builtin_ctz(bits);
+                bits &= bits - 1;
+                sched->hv_tensor_backend_ids[i] = -1;
+                memset(&sched->hv_tensor_copies[i * n_slot_copies], 0, n_slot_copies * sizeof(struct ggml_tensor *));
+            }
+        }
         ggml_hash_set_reset(&sched->hash_set);
-        memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
-        memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
         sched->is_reset = true;
     }
     sched->is_alloc = false;

@@ -972,11 +972,42 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
+// Number of blocks that split the KV cache of each output tile (non-stream-k launches): starts from the occupancy and
+// grows while that reduces the tail of the last wave.
+static int ggml_cuda_fattn_parallel_blocks(const int nsm, const int max_blocks_per_sm, const int ntiles_dst, const int ntiles_KV) {
+    // parallel_blocks must not be larger than what the tensor size allows:
+    int parallel_blocks = std::min(max_blocks_per_sm, ntiles_KV);
+
+    // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
+    // Test whether parallel_blocks can be set to a higher value for better efficiency.
+    const int blocks_per_wave = nsm * max_blocks_per_sm;
+    int nwaves_best = 0;
+    int efficiency_percent_best = 0;
+    for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
+        const int nblocks_total = ntiles_dst * parallel_blocks_test;
+        const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
+        const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
+
+        // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
+        if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
+            break;
+        }
+
+        if (efficiency_percent > efficiency_percent_best) {
+            nwaves_best = nwaves;
+            efficiency_percent_best = efficiency_percent;
+            parallel_blocks = parallel_blocks_test;
+        }
+    }
+    return parallel_blocks;
+}
+
+// parallel_blocks_fixed > 0: use that KV split instead of choosing one (non-stream-k launches only).
 template <int DV, int ncols1, int ncols2>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const bool use_sparse,
-    const int warp_size = WARP_SIZE
+    const int warp_size = WARP_SIZE, const int parallel_blocks_fixed = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1177,30 +1208,8 @@ void launch_fattn(
             dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
-        // parallel_blocks must not be larger than what the tensor size allows:
-        parallel_blocks = std::min(parallel_blocks, ntiles_KV);
-
-        // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
-        // Test whether parallel_blocks can be set to a higher value for better efficiency.
-        const int blocks_per_wave = nsm * max_blocks_per_sm;
-        int nwaves_best = 0;
-        int efficiency_percent_best = 0;
-        for (int parallel_blocks_test = parallel_blocks; parallel_blocks_test <= ntiles_KV; ++parallel_blocks_test) {
-            const int nblocks_total = ntiles_dst * parallel_blocks_test;
-            const int nwaves = (nblocks_total + blocks_per_wave - 1) / blocks_per_wave;
-            const int efficiency_percent = 100 * nblocks_total / (nwaves*blocks_per_wave);
-
-            // Stop trying configurations with more waves if we already have good efficiency to avoid excessive overhead.
-            if (efficiency_percent_best >= 95 && nwaves > nwaves_best) {
-                break;
-            }
-
-            if (efficiency_percent > efficiency_percent_best) {
-                nwaves_best = nwaves;
-                efficiency_percent_best = efficiency_percent;
-                parallel_blocks = parallel_blocks_test;
-            }
-        }
+        parallel_blocks = parallel_blocks_fixed > 0 ? std::min(parallel_blocks_fixed, ntiles_KV) :
+            ggml_cuda_fattn_parallel_blocks(nsm, max_blocks_per_sm, ntiles_dst, ntiles_KV);
 
         blocks_num.x = ntiles_x;
         blocks_num.y = parallel_blocks;

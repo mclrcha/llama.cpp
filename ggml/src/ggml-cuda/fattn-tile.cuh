@@ -215,6 +215,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2, 256, 2, 128,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 256, 2,  64, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 4,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32, 128)
 
@@ -293,6 +294,8 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 8,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
+    // GQA 6: the 6 Q heads of a KV head x 4 tokens in one block, see launch_fattn_tile_gqa6
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 4,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
 
@@ -1314,6 +1317,55 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     GGML_ABORT("fatal error");
 }
 
+#ifdef GGML_USE_HIP
+// RDNA4, q8_0 K/V, GQA 6 (Qwen3.8-27B), 3..4 tokens (MTP verification): one block holds the 6 Q heads of a KV head, so
+// each K/V tile is dequantized once instead of once per pair of heads, and the KV cache is split over at least 6 blocks
+// per SM instead of filling one wave of 2-head blocks (latency bound at long context: 65k 969 -> 708 us). The per-column
+// arithmetic is the same; only the KV split, and so the order in which the partial softmax results are combined, differs
+// (KLD gate: mean KLD 0.0040 at ub 4 / c 4096, below the 0.0047 of a pure reassociation; PPL within the error).
+// GGML_HIP_FA_TILE_GQA6=0 restores the 2-head kernel.
+static bool ggml_cuda_fattn_tile_use_gqa6(const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_HIP_FA_TILE_GQA6");
+        return !value || std::atoi(value) != 0;
+    }();
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    // below 2048 KV cells the 2-head kernel is as fast or faster (1024: 20.7 vs 22.7 us)
+    return enabled && Q->ne[0] == 256 && Q->ne[2] == 6*K->ne[2] && Q->ne[1] >= 3 && Q->ne[1] <= 4 && K->ne[1] >= 2048 &&
+        ggml_cuda_fattn_tile_use_q8_KV(dst);
+}
+
+template <int DKQ, int DV>
+static void launch_fattn_tile_gqa6(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+
+    const int id        = ggml_cuda_get_device();
+    const int cc        = ggml_cuda_info().devices[id].cc;
+    const int nsm       = ggml_cuda_info().devices[id].nsm;
+    const int warp_size = 32;
+
+    constexpr int ncols1 = 4;
+    constexpr int ncols  = ncols1*6;
+    const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols, cc) / warp_size;
+    const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols, cc);
+
+    fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, 6, false, true>;
+
+    int max_blocks_per_sm = 1;
+    CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&max_blocks_per_sm, fattn_kernel, nwarps*warp_size, 0));
+    GGML_ASSERT(max_blocks_per_sm > 0);
+    const int ntiles_dst = K->ne[2] * Q->ne[3];
+    const int ntiles_KV  = (K->ne[1] + nbatch_fa - 1) / nbatch_fa;
+    const int parallel_blocks = std::max(ggml_cuda_fattn_parallel_blocks(nsm, max_blocks_per_sm, ntiles_dst, ntiles_KV),
+        std::min(ntiles_KV, (6*nsm + ntiles_dst - 1) / ntiles_dst));
+
+    launch_fattn<DV, ncols1, 6>
+        (ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, false, false, false, false, warp_size, parallel_blocks);
+}
+#endif // GGML_USE_HIP
+
 template <int DKQ, int DV, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * KQV  = dst;
@@ -1386,6 +1438,15 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
             launch_fattn_tile_switch_ncols1<DKQ, DV, 4, use_logit_softcap>(ctx, dst);
             return;
         }
+
+#ifdef GGML_USE_HIP
+        if constexpr (DKQ == 256 && DV == 256 && !use_logit_softcap) {
+            if (use_gqa_opt && ggml_cuda_fattn_tile_use_gqa6(dst)) {
+                launch_fattn_tile_gqa6<DKQ, DV>(ctx, dst);
+                return;
+            }
+        }
+#endif // GGML_USE_HIP
 
         if (use_gqa_opt && gqa_ratio % 2 == 0) {
             launch_fattn_tile_switch_ncols1<DKQ, DV, 2, use_logit_softcap>(ctx, dst);

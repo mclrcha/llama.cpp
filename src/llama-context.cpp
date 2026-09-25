@@ -646,6 +646,14 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    {
+        const char * value = getenv("LLAMA_DUAL_SCHED");
+        dual_sched = (!value || atoi(value) != 0) && cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !cparams.pipeline_parallel;
+        sched_other.reset();
+        gf_res_prev_active_other = nullptr;
+        sched_slot      = 0;
+        sched_max_nodes = max_nodes;
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -775,6 +783,9 @@ void llama_context::synchronize() {
     }
 
     ggml_backend_sched_synchronize(sched.get());
+    if (sched_other) {
+        ggml_backend_sched_synchronize(sched_other.get());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -880,6 +891,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        gf_res_prev_active_other = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1437,6 +1449,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    if (dual_sched) {
+        const int slot = n_outputs > 0;
+        if (slot != sched_slot) {
+            std::swap(sched, sched_other);
+            std::swap(gf_res_prev_active, gf_res_prev_active_other);
+            sched_slot = slot;
+            if (!sched) {
+                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), sched_max_nodes,
+                    false, cparams.op_offload));
+            }
+        }
     }
 
     auto * res = get_gf_res_prev();
@@ -2584,6 +2609,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    gf_res_prev_active_other = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3680,6 +3706,7 @@ void llama_context::opt_epoch_iter(
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+            gf_res_prev_active_other = nullptr;
             res->reset();
 
             auto * gf = model.build_graph(gparams);

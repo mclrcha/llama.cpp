@@ -368,6 +368,15 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // MTP draft contexts alternate between graphs without outputs (catch-up of the verified tokens) and with outputs
+    // (draft steps). Each kind keeps its own scheduler, so both graphs stay built and allocated (LLAMA_DUAL_SCHED=0 off):
+    // `sched` always belongs to slot `sched_slot` (= n_outputs > 0), `sched_other` to the other one.
+    ggml_backend_sched_ptr sched_other;
+    llm_graph_result * gf_res_prev_active_other = nullptr;
+    int    sched_slot      = 0;
+    size_t sched_max_nodes = 0;
+    bool   dual_sched      = false;
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;

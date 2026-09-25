@@ -355,6 +355,17 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     ggml_tensor * qkv_mixed = qkvz.first;
     ggml_tensor * z         = qkvz.second;
 
+    // Decode and speculative verification: the output gate projection first, so that the output norm, gate and Q8_1
+    // quantization stay adjacent (fused on ROCm). Scheduling only. LLAMA_GDN_EARLY_Z_BATCH=0 keeps the graph order.
+    static const bool early_z_batch = [] {
+        const char * value = std::getenv("LLAMA_GDN_EARLY_Z_BATCH");
+        return !value || std::atoi(value) != 0;
+    }();
+    if (early_z_batch && ubatch.n_tokens <= 4) {
+        ggml_build_forward_expand(gf, z);
+        ggml_build_forward_expand(gf, qkv_mixed);
+    }
+
     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);

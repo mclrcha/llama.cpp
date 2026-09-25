@@ -3888,7 +3888,12 @@ static int ggml_cuda_try_norm_gate(ggml_backend_cuda_context & ctx, ggml_cgraph 
     while (next < graph->n_nodes && next-u <= 4 && ggml_cuda_is_view_or_noop(graph->nodes[next])) { ++next; }
     if (quantize && next < graph->n_nodes && next-u <= 4) {
         auto * mm = graph->nodes[next];
-        if (mm->op == GGML_OP_MUL_MAT && mm->src[0]->type == GGML_TYPE_Q8_0 &&
+        // the Q8_1 layout does not depend on the weight type: any mat-vec consumer reads the cached copy
+        const ggml_type wt = mm->op == GGML_OP_MUL_MAT ? mm->src[0]->type : GGML_TYPE_COUNT;
+        const bool mmvq_consumer = wt == GGML_TYPE_Q8_0 ||
+            ((wt == GGML_TYPE_Q4_K || wt == GGML_TYPE_Q5_K || wt == GGML_TYPE_Q6_K || wt == GGML_TYPE_IQ4_XS) &&
+             ggml_cuda_should_use_mmvq(wt, ggml_cuda_info().devices[ctx.device].cc, mm->src[1]->ne[1]));
+        if (mm->op == GGML_OP_MUL_MAT && mmvq_consumer &&
                 mm->src[1]->op == GGML_OP_RESHAPE && mm->src[1]->src[0] == dst &&
                 mm->src[1]->data == dst->data && ggml_nelements(mm->src[1]) == ggml_nelements(dst) &&
                 mm->src[1]->ne[0] == 128*x->ne[1] && mm->src[1]->ne[0]%512 == 0 &&

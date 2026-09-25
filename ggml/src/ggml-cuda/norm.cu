@@ -919,7 +919,13 @@ static __global__ void rms_norm_gate_128_f32(const float * x, const float * weig
         const float normalized = scale * x[offset + tid] * weight[tid];
         const float g = gate[offset + tid];
         const float silu = g / (1.0f + expf(-g));
-        const float value = normalized * silu;
+        float value;
+        {
+#pragma clang fp contract(off)
+            // Keep the product rounded: otherwise it can contract into the first addition of the Q8_1 sum below
+            // (Q4_K/Q5_K mat-vec kernels read that sum).
+            value = normalized * silu;
+        }
         dst[offset + tid] = value;
         if constexpr (quantize) {
             const float amax = warp_reduce_max<32>(fabsf(value));

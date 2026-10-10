@@ -1362,7 +1362,7 @@ static void launch_fattn_tile_gqa6(ggml_backend_cuda_context & ctx, ggml_tensor 
         std::min(ntiles_KV, (6*nsm + ntiles_dst - 1) / ntiles_dst));
 
     launch_fattn<DV, ncols1, 6>
-        (ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, false, false, false, false, warp_size, parallel_blocks);
+        (ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, false, false, false, false, warp_size, false, parallel_blocks);
 }
 #endif // GGML_USE_HIP
 

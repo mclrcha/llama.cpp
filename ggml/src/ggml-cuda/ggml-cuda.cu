@@ -2957,6 +2957,23 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+#if defined(GGML_USE_HIP)
+    // hipGraphExecUpdate costs ~8 us per node (6.3 ms for the ~800 kernels of a MoE verify graph), a new instance
+    // ~1.7 ms: instantiate again (GGML_HIP_GRAPH_EXEC_UPDATE=1 keeps the update)
+    static const bool exec_update = [] {
+        const char * value = getenv("GGML_HIP_GRAPH_EXEC_UPDATE");
+        return value && atoi(value) != 0;
+    }();
+    if (!exec_update) {
+        // the previous launch of this instance may still be running
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
+        graph->instance = nullptr;
+        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        return;
+    }
+#endif
+
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &result_info);
@@ -6039,8 +6056,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+#if defined(GGML_USE_HIP)
+        } else if (cuda_graph_update_required) { // a new instance needs no update
+#else
         }
         if (cuda_graph_update_required) { // Update graph executable
+#endif
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
         // Launch graph
@@ -6117,13 +6138,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
+#if defined(GGML_USE_HIP)
+                // A graph that replayed several times and then changed (the KV cache grew by a padding step) is
+                // captured again right away instead of being evaluated once without a graph first; graphs that keep
+                // changing still take the warmup path (GGML_HIP_GRAPH_RECAPTURE=0 off).
+                static const bool recapture = [] {
+                    const char * value = getenv("GGML_HIP_GRAPH_RECAPTURE");
+                    return !value || atoi(value) != 0;
+                }();
+                if (properties_changed && recapture && graph->n_stable >= 4 && graph->instance != nullptr) {
+                    use_cuda_graph = true;
+                    cuda_graph_update_required = true;
+                    graph->n_stable = 0;
+                } else
+#endif
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    graph->n_stable = 0;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
+                    graph->n_stable++;
                 }
             }
         }

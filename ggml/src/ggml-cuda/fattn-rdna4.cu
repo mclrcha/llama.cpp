@@ -101,7 +101,7 @@ static __global__ void fattn_rdna4_d256(
         const int nb01, const int nb02, const int64_t nb03,
         const int nb11, const int nb12, const int64_t nb13,
         const int nb21, const int nb22, const int64_t nb23,
-        const int nb31, const int64_t nb33) {
+        const int nb31, const int64_t nb33, const int hp_log2) {
 #ifdef FATTN_RDNA4_AVAILABLE
     using namespace fattn_r4;
     typedef fattn_r4_half8  half8;
@@ -109,16 +109,21 @@ static __global__ void fattn_rdna4_d256(
 
     const int lane = threadIdx.x;
     const int w    = threadIdx.y;
-    const int rg   = w >> 1;      // row group: tokens [16 rg, 16 rg + 16) of the block
+    const int rg   = w >> 1;      // row group of 16 tokens
     const int c    = w & 1;       // KV half of S and DV half of O
     const int h    = lane >> 4;
     const int lq   = lane & 15;
 
+    // A block covers 2^hp_log2 Q heads that share one KV head, each with rgh row groups of tokens: the K/V tiles in SRAM
+    // serve all of them. Every token goes through the same steps as with one head per block.
+    const int rgh  = (NW/2) >> hp_log2;
+    const int hb   = rg / rgh;
+    const int rt   = rg - hb*rgh;
     const int tile = blockIdx.x;
-    const int head = blockIdx.y;
+    const int head = (blockIdx.y << hp_log2) + hb;
     const int seq  = blockIdx.z;
     const int kvh  = head / gqa_ratio;
-    const int tq   = tile*nq(NW) + rg*16 + lq;   // token of the Q/S/O column held by this lane
+    const int tq   = tile*16*rgh + rt*16 + lq;   // token of the Q/S/O column held by this lane
     const bool tq_ok = tq < ne01;
 
     extern __shared__ __align__(16) char fattn_r4_smem[];
@@ -412,7 +417,7 @@ static __global__ void fattn_rdna4_d256(
     }
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, KV_bounds, dst, scale_log2, ne01, ne02, ne11, gqa_ratio, nb01, nb02, nb03,
-        nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33);
+        nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, hp_log2);
     NO_DEVICE_CODE;
 #endif // FATTN_RDNA4_AVAILABLE
 }
@@ -545,7 +550,15 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
     const int ne11   = K->ne[1];
     // 16 waves (128 tokens) per block halve the K/V traffic per FLOP; GGML_HIP_FA_R4_NW=8 selects 64 tokens.
     static const int nw = [] { const char * e = getenv("GGML_HIP_FA_R4_NW"); return e && std::atoi(e) == 8 ? 8 : 16; }();
-    const int nq     = fattn_r4::nq(nw);
+    // Q heads per block: the largest power of 2 that divides the GQA ratio and fits the nw/2 row groups, so that each
+    // K/V tile loaded into SRAM serves several heads (GGML_HIP_FA_R4_HP=1 keeps one head per block)
+    static const int hp_max = [] { const char * e = getenv("GGML_HIP_FA_R4_HP"); return e ? std::max(1, std::atoi(e)) : 64; }();
+    const int gqa = ne02 / K->ne[2];
+    int hp_log2 = 0;
+    while ((2 << hp_log2) <= std::min(nw/2, hp_max) && gqa % (2 << hp_log2) == 0) {
+        hp_log2++;
+    }
+    const int nq     = fattn_r4::nq(nw) >> hp_log2; // tokens per tile
     const int ntiles = (ne01 + nq - 1)/nq;
 
     const int     nb31 = mask ? mask->nb[1] : 0;
@@ -562,14 +575,14 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const dim3 grid(ntiles, ne02, ne03);
+    const dim3 grid(ntiles, ne02 >> hp_log2, ne03);
     const dim3 block(WARP_SIZE, nw);
     const float scale_log2 = scale*1.4426950408889634f;
     const int gqa_ratio = ne02 / K->ne[2];
 #define FATTN_R4_LAUNCH(NW, M) fattn_rdna4_d256<NW, M><<<grid, block, fattn_r4::smem(NW), stream>>>( \
             (const char *) Q->data, K_data, V_data, mask ? (const char *) mask->data : nullptr, mask ? KV_bounds.get() : nullptr, (float *) dst->data, \
             scale_log2, ne01, ne02, ne11, gqa_ratio, Q->nb[1], Q->nb[2], Q->nb[3], \
-            nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33)
+            nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, hp_log2)
     if (nw == 16) {
         if (mask) {
             FATTN_R4_LAUNCH(16, true);

@@ -821,8 +821,123 @@ void quantize_mmq_norm_gate_cuda(const float * x, const float * w, const float *
     }
 }
 
+// silu(gate)*up quantized to the MMQ Q8_1 layout. Each thread handles nchunk groups of 4 values that are 512 apart and
+// issues all their loads first: same values and shuffle groups as quantize_mmq_q8_1<..., silu>, more bytes in flight.
+template <mmq_q8_1_ds_layout ds_layout, int nchunk>
+static __global__ void quantize_mmq_silu_chunked(
+        const float * __restrict__ gate, const float * __restrict__ up, const int32_t * __restrict__ ids, void * __restrict__ vy,
+        const int64_t ne0, const int ne1) {
+    // the products feed the block sums: no fma contraction, or the sums differ from the unfused path by one ulp
+#pragma clang fp contract(off)
+    constexpr int vals_per_scale = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 64 : 32;
+    constexpr int vals_per_sum   = ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6 ? 16 : 32;
+    constexpr int chunk_vals     = 4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ;
+
+    const int64_t base_i0 = ((int64_t) blockIdx.y*nchunk*chunk_vals) + threadIdx.x*4;
+    const int64_t i01     = ids ? ids[blockIdx.x] : blockIdx.x;
+    const int64_t base    = i01*ne0;
+
+    ggml_cuda_pdl_sync();
+
+    float4 xg[nchunk];
+    float4 xu[nchunk];
+#pragma unroll
+    for (int c = 0; c < nchunk; ++c) {
+        const int64_t i0 = base_i0 + c*chunk_vals;
+        if (i0 < ne0) {
+            xg[c] = ((const float4 *) gate)[(base + i0)/4];
+            xu[c] = ((const float4 *) up)  [(base + i0)/4];
+        }
+    }
+
+    block_q8_1_mmq * y = (block_q8_1_mmq *) vy;
+
+#pragma unroll
+    for (int c = 0; c < nchunk; ++c) {
+        const int64_t i0 = base_i0 + c*chunk_vals;
+        if (i0 >= ne0) {
+            break; // ne0 is a multiple of chunk_vals: uniform for the whole block
+        }
+
+        float4 xi;
+        xi.x = ggml_cuda_op_silu_single(xg[c].x)*xu[c].x;
+        xi.y = ggml_cuda_op_silu_single(xg[c].y)*xu[c].y;
+        xi.z = ggml_cuda_op_silu_single(xg[c].z)*xu[c].z;
+        xi.w = ggml_cuda_op_silu_single(xg[c].w)*xu[c].w;
+
+        float amax = fabsf(xi.x);
+        amax = fmaxf(amax, fabsf(xi.y));
+        amax = fmaxf(amax, fabsf(xi.z));
+        amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+        for (int offset = vals_per_scale/8; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, offset, WARP_SIZE));
+        }
+
+        float sum;
+        if (ds_layout != MMQ_Q8_1_DS_LAYOUT_D4) {
+            sum = xi.x + xi.y + xi.z + xi.w;
+#pragma unroll
+            for (int offset = vals_per_sum/8; offset > 0; offset >>= 1) {
+                sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
+            }
+        }
+
+        const float d_inv = 127.0f / amax;
+        char4 q;
+        q.x = roundf(xi.x*d_inv);
+        q.y = roundf(xi.y*d_inv);
+        q.z = roundf(xi.z*d_inv);
+        q.w = roundf(xi.w*d_inv);
+        const float d = 1.0f / d_inv;
+
+        const int64_t k_block = i0 / QK8_1_MMQ;
+        const int64_t iqs     = i0 % QK8_1_MMQ;
+        const int64_t ib      = k_block*ne1 + blockIdx.x;
+
+        char4 * yqs4 = (char4 *) y[ib].qs;
+        yqs4[iqs/4] = q;
+
+        if (ds_layout == MMQ_Q8_1_DS_LAYOUT_D2S6) {
+            if (iqs % 16 == 0 && iqs < 96) {
+                y[ib].d2s6[2 + iqs/16] = sum;
+                if (iqs % 64 == 0) {
+                    y[ib].d2s6[iqs/64] = d;
+                }
+            }
+        } else if (iqs % 32 == 0) {
+            if (ds_layout == MMQ_Q8_1_DS_LAYOUT_DS4) {
+                y[ib].ds4[iqs/32] = make_half2(d, sum);
+            } else {
+                y[ib].d4[iqs/32]  = d;
+            }
+        }
+    }
+}
+
 void quantize_mmq_silu_cuda(const float * gate,const float * up,void * dst,ggml_type type,
         int64_t k,int64_t n,cudaStream_t stream,const int32_t * ids) {
+    static const int nchunk = [] {
+        const char * value = getenv("GGML_HIP_QUANT_SILU_CHUNKS");
+        return value ? std::atoi(value) : 4;
+    }();
+    GGML_ASSERT(k % (4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ) == 0);
+    if (nchunk == 4 || nchunk == 2) {
+        const int64_t chunks = k/(4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+        const dim3 grid_c(n, (chunks + nchunk - 1)/nchunk);
+        const dim3 block_c(CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
+#define QUANT_SILU_CHUNKED(layout) \
+        if (nchunk == 4) { quantize_mmq_silu_chunked<layout, 4><<<grid_c, block_c, 0, stream>>>(gate, up, ids, dst, k, n); } \
+        else             { quantize_mmq_silu_chunked<layout, 2><<<grid_c, block_c, 0, stream>>>(gate, up, ids, dst, k, n); }
+        switch (mmq_get_q8_1_ds_layout(type)) {
+            case MMQ_Q8_1_DS_LAYOUT_D4:   QUANT_SILU_CHUNKED(MMQ_Q8_1_DS_LAYOUT_D4);   break;
+            case MMQ_Q8_1_DS_LAYOUT_DS4:  QUANT_SILU_CHUNKED(MMQ_Q8_1_DS_LAYOUT_DS4);  break;
+            case MMQ_Q8_1_DS_LAYOUT_D2S6: QUANT_SILU_CHUNKED(MMQ_Q8_1_DS_LAYOUT_D2S6); break;
+            default: GGML_ABORT("unsupported MMQ layout");
+        }
+#undef QUANT_SILU_CHUNKED
+        return;
+    }
     const dim3 grid(n,k/(4*CUDA_QUANTIZE_BLOCK_SIZE_MMQ));
     const dim3 block(CUDA_QUANTIZE_BLOCK_SIZE_MMQ);
     switch(mmq_get_q8_1_ds_layout(type)) {

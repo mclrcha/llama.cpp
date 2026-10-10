@@ -1621,7 +1621,8 @@ ggml_tensor * llm_graph_context::build_cvec(
 ggml_tensor * llm_graph_context::build_draft_lm_head(
           ggml_tensor * w,
           ggml_tensor * cur,
-          ggml_tensor * w_s) const {
+          ggml_tensor * w_s,
+          ggml_tensor * w_draft) const {
     static const int64_t draft_vocab = [] {
         // 98304 keeps the MTP acceptance of Qwen3.6/3.8 (248320 tokens, BPE ids roughly by frequency) nearly unchanged
         // while reading 40% of the LM head per draft token. 0 uses the full vocabulary.
@@ -1633,7 +1634,8 @@ ggml_tensor * llm_graph_context::build_draft_lm_head(
             cur->ne[2] != 1 || cur->ne[3] != 1) {
         return build_lora_mm(w, cur, w_s);
     }
-    ggml_tensor * w_sub  = ggml_view_2d(ctx0, w, w->ne[0], draft_vocab, w->nb[1], 0);
+    ggml_tensor * w_sub  = w_draft && w_draft->ne[0] == w->ne[0] && w_draft->ne[1] == draft_vocab ? w_draft :
+        ggml_view_2d(ctx0, w, w->ne[0], draft_vocab, w->nb[1], 0);
     ggml_tensor * logits = ggml_mul_mat(ctx0, w_sub, cur);
 
     // Backend samplers only see the scored rows: the -inf rest never enters a top-k and adds 0 to a softmax, and the

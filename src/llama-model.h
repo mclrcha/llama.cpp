@@ -662,6 +662,7 @@ struct llama_model {
     struct ggml_tensor * output_res_score = nullptr; // kimi-k3: final cross-layer residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
+    struct ggml_tensor * output_draft    = nullptr; // MTP draft LM head: first draft-vocab rows of output, requantized
     struct ggml_tensor * output_b        = nullptr;
     struct ggml_tensor * output_norm_enc = nullptr;
 
@@ -863,6 +864,9 @@ struct llama_model_base : public llama_model {
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;
     bool load_tensors(llama_model_loader & ml) override;
+
+    // copy of the first draft-vocab rows of the LM head in a smaller type for the MTP draft head (see llama-model.cpp)
+    void build_mtp_draft_head();
 
     // model must define these
     void load_arch_hparams(llama_model_loader & ml) override = 0;

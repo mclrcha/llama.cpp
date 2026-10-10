@@ -1096,10 +1096,12 @@ struct llm_graph_context {
 
     // LM head of a speculative draft: restricted to the first LLAMA_MTP_DRAFT_VOCAB tokens (default 98304; the other
     // logits are -inf). Only the proposals change; the target model still samples every accepted token.
+    // w_draft: optional copy of those rows in a smaller type (llama_model::output_draft)
     ggml_tensor * build_draft_lm_head(
               ggml_tensor * w,
               ggml_tensor * cur,
-              ggml_tensor * w_s) const;
+              ggml_tensor * w_s,
+              ggml_tensor * w_draft = nullptr) const;
 
 
     // do mat_mul_id, while optionally apply lora and per-expert scale

@@ -1918,6 +1918,93 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
     return true;
 }
 
+#if defined(GGML_USE_HIP)
+// Prefill f32 projections with few output rows (GDN alpha and beta: 32 each) leave most of the GPU idle in BLAS (16
+// workgroups). Two sibling projections of the same activations run as one strided batched GEMM at the first node; the
+// second result waits in a context buffer until its own node, so no compute buffer memory is written early.
+// GGML_HIP_F32_PAIR=0 off.
+static bool ggml_cuda_f32_pair_ok(const ggml_tensor * t) {
+    const ggml_tensor * w = t->src[0];
+    const ggml_tensor * x = t->src[1];
+    return t->op == GGML_OP_MUL_MAT && (t->flags & GGML_TENSOR_FLAG_COMPUTE) && w->type == GGML_TYPE_F32 &&
+        x->type == GGML_TYPE_F32 && t->type == GGML_TYPE_F32 && ggml_is_contiguous(w) && ggml_is_contiguous(x) &&
+        ggml_is_contiguous(t) && w->ne[2] == 1 && w->ne[3] == 1 && x->ne[2] == 1 && x->ne[3] == 1 &&
+        w->ne[1] <= 64 && x->ne[1] >= 32 && w->buffer && !ggml_backend_buffer_is_host(w->buffer);
+}
+
+static bool ggml_cuda_mul_mat_f32_pair(ggml_backend_cuda_context & ctx, ggml_cgraph * cgraph, int i) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_HIP_F32_PAIR");
+        return !value || std::atoi(value) != 0;
+    }();
+    ggml_tensor * node = cgraph->nodes[i];
+    auto & pair = ctx.f32_pair;
+    cudaStream_t stream = ctx.stream();
+
+    if (pair.partner == node) {
+        CUDA_CHECK(cudaMemcpyAsync(node->data, (char *) pair.data + pair.offset, ggml_nbytes(node), cudaMemcpyDeviceToDevice, stream));
+        pair.partner = nullptr;
+        return true;
+    }
+    if (!enabled || ctx.curr_stream_no != 0 || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc) ||
+            !ggml_cuda_f32_pair_ok(node)) {
+        return false;
+    }
+
+    const ggml_tensor * w0 = node->src[0];
+    const ggml_tensor * x  = node->src[1];
+    ggml_tensor * other = nullptr;
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 16; ++j) {
+        ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_f32_pair_ok(t) && t->src[1] == x && ggml_are_same_shape(t->src[0], w0) && t->src[0]->nb[1] == w0->nb[1]) {
+            other = t;
+            break;
+        }
+    }
+    if (!other) {
+        return false;
+    }
+
+    const int64_t K = w0->ne[0];
+    const int64_t N = w0->ne[1];
+    const int64_t M = x->ne[1];
+    const size_t  nbytes = 2*ggml_nbytes(node);
+    if (pair.size < nbytes) {
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        if (status != hipStreamCaptureStatusNone) {
+            return false;
+        }
+        if (pair.data) {
+            CUDA_CHECK(cudaFree(pair.data));
+        }
+        CUDA_CHECK(cudaMalloc(&pair.data, nbytes));
+        pair.size = nbytes;
+    }
+
+    // batch 0 is the lower weight address so that the A stride is positive
+    const bool node_first = w0->data < other->src[0]->data;
+    const float * wa = (const float *) (node_first ? w0->data : other->src[0]->data);
+    const float * wb = (const float *) (node_first ? other->src[0]->data : w0->data);
+    const long long stride_a = wb - wa;
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
+    cublasHandle_t h = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(h, stream));
+    CUBLAS_CHECK(cublasSgemmStridedBatched(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+        &alpha, wa, w0->nb[1]/sizeof(float), stride_a,
+        (const float *) x->data, x->nb[1]/sizeof(float), 0,
+        &beta, (float *) pair.data, N, N*M, 2));
+
+    const size_t off_node  = node_first ? 0 : ggml_nbytes(node);
+    const size_t off_other = node_first ? ggml_nbytes(node) : 0;
+    CUDA_CHECK(cudaMemcpyAsync(node->data, (char *) pair.data + off_node, ggml_nbytes(node), cudaMemcpyDeviceToDevice, stream));
+    pair.partner = other;
+    pair.offset  = off_other;
+    return true;
+}
+#endif
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -5783,6 +5870,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         continue;
                     }
                 }
+                if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_f32_pair(*cuda_ctx, cgraph, i)) {
+                    cuda_ctx->mmvq_cache.invalidate_write(node);
+                    cuda_ctx->mmq_cache.invalidate_write(node);
+                    cuda_ctx->mmq_ids_cache.invalidate_write(node);
+                    continue;
+                }
 #endif
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
@@ -5866,6 +5959,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cache.reset();
     cuda_ctx->mmq_cache.reset();
     cuda_ctx->mmq_ids_cache.reset();
+    cuda_ctx->f32_pair.partner = nullptr;
     cuda_ctx->gdn_deferred_gather.clear();
     cache.enabled = !disable_mmvq_cache && cuda_ctx->stream_context().concurrent_events.empty() &&
                     GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[cuda_ctx->device].cc);

@@ -1751,6 +1751,13 @@ struct ggml_backend_cuda_context {
     ggml_hip_mmvq_cache mmvq_cache;
     ggml_hip_mmq_cache  mmq_cache;
     ggml_hip_mmq_ids_cache mmq_ids_cache;
+    // prefill f32 projections run as one batched GEMM with a later sibling (see ggml_cuda_mul_mat_f32_pair)
+    struct {
+        void *              data    = nullptr;
+        size_t              size    = 0;
+        const ggml_tensor * partner = nullptr; // node whose result waits in data + offset
+        size_t              offset  = 0;
+    } f32_pair;
     // GATED_DELTA_NET nodes whose initial state gather (GET_ROWS of the recurrent cache) was skipped: the op reads the
     // state from the cache row instead. Filled and consumed during one graph evaluation.
     std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_deferred_gather;

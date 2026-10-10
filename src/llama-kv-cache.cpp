@@ -1869,6 +1869,107 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+int64_t llama_kv_cache::kq_mask_tail(const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv, int64_t & n_tail) const {
+    n_tail = 0;
+
+    static const bool enabled = [] {
+        const char * value = getenv("LLAMA_KQ_MASK_SPLIT");
+        return !value || atoi(value) != 0;
+    }();
+    // decode masks are small: building them on the host is cheaper than extra graph nodes
+    if (!enabled || ubatch->n_tokens < 32) {
+        return -1;
+    }
+
+    if (!causal_attn && hparams.non_causal_type == LLAMA_NON_CAUSAL_TYPE_SWA_ONLY) {
+        causal_attn = swa_type == LLAMA_SWA_TYPE_NONE;
+    }
+
+    if (n_seq_max != 1 || v_cells.size() != 1 || !causal_attn || swa_type != LLAMA_SWA_TYPE_NONE ||
+            hparams.use_alibi || (int64_t) v_cells[0].size() < n_kv) {
+        return -1;
+    }
+
+    const llama_pos * pos = v_cells[0].pos_data();
+
+    llama_pos pos_min = INT32_MAX;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        pos_min = std::min(pos_min, ubatch->pos[i]);
+    }
+
+    // the cells at or after the first position of the ubatch must be one contiguous range
+    int64_t j0 = -1;
+    int64_t j1 = -1;
+    for (int64_t j = 0; j < n_kv; ++j) {
+        if (pos[j] >= pos_min) {
+            if (j0 < 0) {
+                j0 = j;
+            }
+            j1 = j;
+            n_tail++;
+        }
+    }
+
+    if (n_tail == 0 || j1 - j0 + 1 != n_tail) {
+        n_tail = 0;
+        return -1;
+    }
+
+    return j0;
+}
+
+template <typename T>
+static void set_input_kq_mask_split_impl(const llama_kv_cells & cells, const llama_ubatch * ubatch, int64_t n_kv, int64_t j0,
+        int64_t n_tail, T * row, T * tail) {
+    const T mask_keep = llama_cast<T>(0.0f);
+    const T mask_drop = llama_cast<T>(-INFINITY);
+    const llama_pos * pos = cells.pos_data();
+    const bool is_2d = ubatch->is_pos_2d();
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    llama_pos pos_min = INT32_MAX;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        pos_min = std::min(pos_min, ubatch->pos[i]);
+    }
+
+    // same values as row 0 of set_input_kq_mask_single_seq outside [j0, j0 + n_tail), where every row is the same
+    for (int64_t j = 0; j < n_kv; ++j) {
+        row[j] = pos[j] >= 0 && pos[j] < pos_min ? mask_keep : mask_drop;
+    }
+
+    const llama_pos * pt = pos + j0;
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        const llama_pos p1 = ubatch->pos[i];
+        T * dst = tail + (int64_t) i*n_tail;
+        for (int64_t t = 0; t < n_tail; ++t) {
+            dst[t] = pt[t] >= 0 && pt[t] <= p1 ? mask_keep : mask_drop;
+        }
+        if (is_2d) {
+            const llama_pos p1_x = ubatch->pos[i + n_tokens*2];
+            const llama_pos p1_y = ubatch->pos[i + n_tokens];
+            for (int64_t t = 0; t < n_tail; ++t) {
+                if (pt[t] == p1 && cells.ext_get(j0 + t).is_2d_gt(p1_x, p1_y)) {
+                    dst[t] = mask_drop;
+                }
+            }
+        }
+    }
+}
+
+void llama_kv_cache::set_input_kq_mask_split(ggml_tensor * row, ggml_tensor * tail, int64_t j0, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(row->buffer) && ggml_backend_buffer_is_host(tail->buffer));
+    GGML_ASSERT(row->type == tail->type && tail->ne[1] == (int64_t) ubatch->n_tokens);
+
+    const int64_t n_kv   = row->ne[0];
+    const int64_t n_tail = tail->ne[0];
+
+    if (row->type == GGML_TYPE_F16) {
+        set_input_kq_mask_split_impl<ggml_fp16_t>(v_cells[0], ubatch, n_kv, j0, n_tail, (ggml_fp16_t *) row->data, (ggml_fp16_t *) tail->data);
+    } else {
+        set_input_kq_mask_split_impl<float>(v_cells[0], ubatch, n_kv, j0, n_tail, (float *) row->data, (float *) tail->data);
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -3006,6 +3107,14 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+int64_t llama_kv_cache_context::kq_mask_tail(const llama_ubatch * ubatch, bool causal_attn, int64_t & n_tail) const {
+    return kv->kq_mask_tail(ubatch, causal_attn, n_kv, n_tail);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_split(ggml_tensor * row, ggml_tensor * tail, int64_t j0, const llama_ubatch * ubatch) const {
+    kv->set_input_kq_mask_split(row, tail, j0, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

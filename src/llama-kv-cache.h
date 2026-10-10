@@ -236,6 +236,12 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // prefill mask of a single causal sequence: outside the cells of the ubatch every row is the same, so the mask is
+    // one base row plus the causal block of those cells. returns the first cell of the block (n_tail cells), or -1 when
+    // the full mask has to be built on the host
+    int64_t kq_mask_tail(const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv, int64_t & n_tail) const;
+    void    set_input_kq_mask_split(ggml_tensor * row, ggml_tensor * tail, int64_t j0, const llama_ubatch * ubatch) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -431,6 +437,10 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
+    // see llama_kv_cache::kq_mask_tail()
+    int64_t kq_mask_tail(const llama_ubatch * ubatch, bool causal_attn, int64_t & n_tail) const;
+    void    set_input_kq_mask_split(ggml_tensor * row, ggml_tensor * tail, int64_t j0, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;

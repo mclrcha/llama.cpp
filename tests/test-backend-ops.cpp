@@ -10604,6 +10604,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int dim = 1; dim < GGML_MAX_DIMS; ++dim) {
         test_cases.emplace_back(new test_set(GGML_TYPE_I32, GGML_TYPE_I32, {6, 5, 4, 3}, dim, false));
         test_cases.emplace_back(new test_set(GGML_TYPE_I32, GGML_TYPE_I32, {6, 5, 4, 3}, dim, true));
+        test_cases.emplace_back(new test_set(GGML_TYPE_F16, GGML_TYPE_F16, {6, 5, 4, 3}, dim, false));
+        test_cases.emplace_back(new test_set(GGML_TYPE_F16, GGML_TYPE_F16, {6, 5, 4, 3}, dim, true));
     }
 
     // same-type copy

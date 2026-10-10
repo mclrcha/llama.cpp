@@ -358,6 +358,13 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // split prefill mask (see llama_kv_cache::kq_mask_tail): the graph repeats a base row and writes the causal block
+    // of the ubatch cells into it, self_kq_mask is then null and self_kq_mask_cnv is the computed mask
+    bool          kq_mask_split_allowed = false;
+    ggml_tensor * self_kq_mask_row  = nullptr; // F32/F16 [n_kv]
+    ggml_tensor * self_kq_mask_tail = nullptr; // F32/F16 [n_tail, n_batch]
+    int64_t       self_kq_mask_j0   = -1;
+
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;

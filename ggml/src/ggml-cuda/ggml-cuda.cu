@@ -6826,7 +6826,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_SET:
             {
                 const ggml_type t = op->type;
-                return (t == GGML_TYPE_F32 || t == GGML_TYPE_I32) &&
+                return (t == GGML_TYPE_F32 || t == GGML_TYPE_F16 || t == GGML_TYPE_I32) &&
                     t == op->src[0]->type &&
                     t == op->src[1]->type;
             } break;

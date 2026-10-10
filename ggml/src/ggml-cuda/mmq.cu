@@ -140,6 +140,38 @@ static ggml_prec ggml_cuda_mmq_get_prec_src1(const ggml_tensor * src0, const ggm
     return GGML_PREC_Q4;
 }
 
+#if defined(GGML_USE_HIP)
+// MoE MMQ without stream-k launches one block per (row tile, column tile, expert) for the worst case of all tokens on
+// one expert, so ~95% of the blocks exit at once (65536 blocks for a 2048-token gate projection). The list of the
+// non-empty (expert << 16 | column tile) pairs, -1 padded, lets the kernel run only those (GGML_HIP_MMQ_IDS_TILES=0 off).
+static __global__ void mmq_ids_build_tiles(
+        const int32_t * __restrict__ expert_bounds, const int n_experts, const int J, int32_t * __restrict__ tiles, const int ntiles_max) {
+    __shared__ int scan[1024];
+
+    const int e   = threadIdx.x;
+    const int cnt = e < n_experts ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J : 0;
+
+    scan[e] = cnt;
+    __syncthreads();
+    for (int off = 1; off < (int) blockDim.x; off <<= 1) {
+        const int v = e >= off ? scan[e - off] : 0;
+        __syncthreads();
+        scan[e] += v;
+        __syncthreads();
+    }
+
+    const int beg = scan[e] - cnt;
+    for (int k = 0; k < cnt; ++k) {
+        tiles[beg + k] = (e << 16) | k;
+    }
+
+    const int total = scan[blockDim.x - 1];
+    for (int i = total + e; i < ntiles_max; i += blockDim.x) {
+        tiles[i] = -1;
+    }
+}
+#endif
+
 void ggml_cuda_mul_mat_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_tensor * silu_gate, const ggml_tensor * silu_up,
         const void * src1_q8_1_pre) {
@@ -436,13 +468,28 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
-    const mmq_args args = {
+    mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1_d, ids_dst_d, expert_bounds_d, dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, J_best};
+
+    ggml_cuda_pool_alloc<int32_t> tiles(ctx.pool());
+#if defined(GGML_USE_HIP)
+    static const bool tiles_enabled = [] {
+        const char * value = getenv("GGML_HIP_MMQ_IDS_TILES");
+        return !value || std::atoi(value) != 0;
+    }();
+    if (tiles_enabled && ne02 <= 1024 && ne03 == 1 && !ggml_cuda_mmq_get_stream_k(src0->type, J_best, fallback, cc, prec_src1)) {
+        // sum over experts of ceil(n_e/J) <= n_rows/J + n_experts
+        args.ntiles_max = (ne_get_rows + J_best - 1)/J_best + ne02;
+        args.tiles      = tiles.alloc(args.ntiles_max);
+        mmq_ids_build_tiles<<<1, 1024, 0, stream>>>(expert_bounds_d, (int) ne02, J_best, tiles.get(), (int) args.ntiles_max);
+        CUDA_CHECK(cudaGetLastError());
+    }
+#endif
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }

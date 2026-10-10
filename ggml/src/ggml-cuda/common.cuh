@@ -1735,6 +1735,23 @@ struct ggml_hip_mmq_ids_cache {
 };
 #endif
 
+#if defined(GGML_USE_HIP)
+// Host inputs of a graph split, uploaded by one kernel instead of one copy each (ggml_backend_cuda_set_tensors_gather_async).
+// The data are copied to a slot of mapped, coherent pinned memory first, so the caller can overwrite them right away and
+// the scheduler does not wait for the upload; a slot is reused once its kernel has finished (GGML_HIP_INPUT_GATHER=0 off).
+struct ggml_hip_input_gather {
+    static constexpr int    n_slots    = 4;
+    static constexpr size_t slot_bytes = 1u << 20;
+
+    uint8_t *   host = nullptr;
+    uint8_t *   dev  = nullptr;
+    cudaEvent_t done[n_slots] = {};
+    bool        busy[n_slots] = {};
+    int         next   = 0;
+    bool        failed = false;
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1751,6 +1768,7 @@ struct ggml_backend_cuda_context {
     ggml_hip_mmvq_cache mmvq_cache;
     ggml_hip_mmq_cache  mmq_cache;
     ggml_hip_mmq_ids_cache mmq_ids_cache;
+    ggml_hip_input_gather  input_gather;
     // prefill f32 projections run as one batched GEMM with a later sibling (see ggml_cuda_mul_mat_f32_pair)
     struct {
         void *              data    = nullptr;

@@ -708,6 +708,16 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUDA_CHECK(cudaFree(data));
         }
     }
+    if (input_gather.host) {
+        ggml_cuda_set_device(device);
+        for (int i = 0; i < ggml_hip_input_gather::n_slots; ++i) {
+            if (input_gather.done[i]) {
+                CUDA_CHECK(cudaEventSynchronize(input_gather.done[i]));
+                CUDA_CHECK(cudaEventDestroy(input_gather.done[i]));
+            }
+        }
+        CUDA_CHECK(cudaFreeHost(input_gather.host));
+    }
 #endif
 
     if (copy_event != nullptr) {
@@ -2638,6 +2648,117 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
+
+#if defined(GGML_USE_HIP)
+#define GGML_HIP_INPUT_GATHER_MAX 16
+
+struct ggml_hip_input_gather_args {
+    const uint8_t * src;                              // staging slot (device pointer of mapped host memory)
+    char *          dst [GGML_HIP_INPUT_GATHER_MAX];
+    uint32_t        off [GGML_HIP_INPUT_GATHER_MAX];  // 16-byte aligned offsets in the slot
+    uint32_t        size[GGML_HIP_INPUT_GATHER_MAX];
+    int             n;
+};
+
+// one segment per blockIdx.y; 16-byte stores where the destination allows them, bytes for the rest
+static __global__ void k_input_gather(const ggml_hip_input_gather_args args) {
+    const int s = blockIdx.y;
+    if (s >= args.n) {
+        return;
+    }
+    const uint8_t * src  = args.src + args.off[s];
+    char *          dst  = args.dst[s];
+    const uint32_t  size = args.size[s];
+    const uint32_t  n16  = (reinterpret_cast<uintptr_t>(dst) % 16 == 0) ? size / 16 : 0;
+    const uint32_t  step = gridDim.x * blockDim.x;
+    for (uint32_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n16; i += step) {
+        reinterpret_cast<int4 *>(dst)[i] = reinterpret_cast<const int4 *>(src)[i];
+    }
+    for (uint32_t i = n16 * 16 + blockIdx.x * blockDim.x + threadIdx.x; i < size; i += step) {
+        dst[i] = src[i];
+    }
+}
+
+// Uploads n host buffers into tensors of this device with one kernel. Returns false (nothing done) when disabled or when
+// the inputs do not fit a staging slot; the caller then copies them one by one.
+static bool ggml_backend_cuda_set_tensors_gather_async(ggml_backend_t backend, int n, ggml_tensor * const * tensors,
+        const void * const * data, const size_t * sizes) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_HIP_INPUT_GATHER");
+        return !value || atoi(value) != 0;
+    }();
+    if (!enabled || n <= 0 || n > GGML_HIP_INPUT_GATHER_MAX || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_hip_input_gather & g = cuda_ctx->input_gather;
+    if (g.failed) {
+        return false;
+    }
+
+    ggml_hip_input_gather_args args = {};
+    size_t   total   = 0;
+    uint32_t max_n16 = 0;
+    for (int i = 0; i < n; ++i) {
+        const ggml_tensor * t = tensors[i];
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr || buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device) || t->data == nullptr) {
+            return false;
+        }
+        args.dst[i]  = (char *) t->data;
+        args.off[i]  = (uint32_t) total;
+        args.size[i] = (uint32_t) sizes[i];
+        max_n16      = std::max(max_n16, (uint32_t) (sizes[i] / 16));
+        total       += GGML_PAD(sizes[i], 16);
+        if (total > ggml_hip_input_gather::slot_bytes) {
+            return false;
+        }
+    }
+
+    if (g.host == nullptr) {
+        ggml_cuda_set_device(cuda_ctx->device);
+        void * host = nullptr;
+        if (hipHostMalloc(&host, ggml_hip_input_gather::n_slots * ggml_hip_input_gather::slot_bytes,
+                    hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess) {
+            (void) hipGetLastError();
+            g.failed = true;
+            return false;
+        }
+        void * dev = nullptr;
+        if (hipHostGetDevicePointer(&dev, host, 0) != hipSuccess) {
+            (void) hipGetLastError();
+            CUDA_CHECK(cudaFreeHost(host));
+            g.failed = true;
+            return false;
+        }
+        for (int i = 0; i < ggml_hip_input_gather::n_slots; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&g.done[i], cudaEventDisableTiming));
+        }
+        g.host = (uint8_t *) host;
+        g.dev  = (uint8_t *) dev;
+    }
+
+    const int slot = g.next;
+    if (g.busy[slot]) {
+        CUDA_CHECK(cudaEventSynchronize(g.done[slot]));
+    }
+    uint8_t * host_slot = g.host + slot * ggml_hip_input_gather::slot_bytes;
+    for (int i = 0; i < n; ++i) {
+        memcpy(host_slot + args.off[i], data[i], sizes[i]);
+    }
+    args.src = g.dev + slot * ggml_hip_input_gather::slot_bytes;
+    args.n   = n;
+
+    cudaStream_t stream = cuda_ctx->stream();
+    const dim3 grid(std::min<uint32_t>(32, std::max<uint32_t>(1, (max_n16 + 255) / 256)), n, 1);
+    k_input_gather<<<grid, 256, 0, stream>>>(args);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaEventRecord(g.done[slot], stream));
+    g.busy[slot] = true;
+    g.next       = (slot + 1) % ggml_hip_input_gather::n_slots;
+    return true;
+}
+#endif // defined(GGML_USE_HIP)
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
@@ -7390,6 +7511,11 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
+#if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_set_tensors_gather_async") == 0) {
+        return (void *)ggml_backend_cuda_set_tensors_gather_async;
+    }
+#endif
     return nullptr;
 }
 

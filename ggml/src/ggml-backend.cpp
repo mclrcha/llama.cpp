@@ -1878,6 +1878,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const bool batch_host_inputs = batch_inputs_mode != 0 && split_backend->iface.set_tensor_async &&
             strncmp(ggml_backend_name(split_backend), "ROCm", 4) == 0;
         bool pending_host_inputs = false;
+        // host inputs of a ROCm split, uploaded together after the loop (one kernel when the backend can gather them)
+        constexpr int max_gather = 16;
+        int           n_gather = 0;
+        bool          gather_overflow = false;
+        ggml_tensor * gather_dst [max_gather];
+        const void *  gather_src [max_gather];
+        size_t        gather_size[max_gather];
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
@@ -1908,12 +1915,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
                 GGML_ASSERT(ggml_are_same_layout(input, input_cpy));
-                ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                if (ggml_nbytes(input) > 0) {
+                    if (!gather_overflow && n_gather == max_gather) {
+                        for (int i = 0; i < n_gather; ++i) {
+                            ggml_backend_tensor_set_async(split_backend, gather_dst[i], gather_src[i], 0, gather_size[i]);
+                        }
+                        n_gather = 0;
+                        gather_overflow = true;
+                    }
+                    if (gather_overflow) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                    } else {
+                        gather_dst [n_gather] = input_cpy;
+                        gather_src [n_gather] = input->data;
+                        gather_size[n_gather] = ggml_nbytes(input);
+                        n_gather++;
+                    }
+                }
                 pending_host_inputs = true;
                 continue;
             }
 
             ggml_backend_sched_copy_input(sched, split, input);
+        }
+        if (n_gather > 0) {
+            typedef bool (*gather_fn_t)(ggml_backend_t, int, ggml_tensor * const *, const void * const *, const size_t *);
+            ggml_backend_dev_t dev = ggml_backend_get_device(split_backend);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto gather_fn = reg ? (gather_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_tensors_gather_async") : nullptr;
+            if (gather_fn && gather_fn(split_backend, n_gather, gather_dst, gather_src, gather_size)) {
+                // the data were staged by the backend: nothing reads the host inputs after this point
+                pending_host_inputs = gather_overflow;
+            } else {
+                for (int i = 0; i < n_gather; ++i) {
+                    ggml_backend_tensor_set_async(split_backend, gather_dst[i], gather_src[i], 0, gather_size[i]);
+                }
+            }
         }
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             if (ggml_backend_sched_is_host_weight(split->inputs[input_id])) {

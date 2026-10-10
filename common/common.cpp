@@ -1511,6 +1511,26 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
             common_batch batch = common_batch_get_one(lctx, tmp);
             llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         }
+
+        // also run one full ubatch, so that the first long prompt does not pay for loading the prefill kernels and
+        // initializing the BLAS solutions (~1.2 s on the R9700 MoE model); LLAMA_WARMUP_UBATCH=0 skips it
+        const char * warmup_ubatch = getenv("LLAMA_WARMUP_UBATCH");
+        const uint32_t n_warmup = std::min<uint32_t>(llama_n_ubatch(lctx), llama_n_ctx(lctx)/2);
+        if ((!warmup_ubatch || atoi(warmup_ubatch) != 0) && llama_model_has_decoder(model) && !llama_model_has_encoder(model) &&
+                n_warmup >= 32) {
+            llama_memory_clear(llama_get_memory(lctx), true);
+
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            std::vector<llama_token> toks(n_warmup);
+            for (uint32_t i = 0; i < n_warmup; ++i) {
+                toks[i] = (llama_token) ((7919ull*i + 13) % (uint64_t) n_vocab);
+            }
+            if (bos != LLAMA_TOKEN_NULL) {
+                toks[0] = bos;
+            }
+            common_batch batch = common_batch_get_one(lctx, toks);
+            llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        }
         llama_memory_clear(llama_get_memory(lctx), true);
         llama_synchronize(lctx);
         llama_perf_context_reset(lctx);

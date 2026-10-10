@@ -30,8 +30,14 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
@@ -2373,6 +2379,81 @@ void common_prompt_checkpoint::update_pos(
     this->n_tokens = n_tokens;
     this->pos_min  = pos_min;
     this->pos_max  = pos_max;
+}
+
+namespace {
+struct common_state_pool {
+    std::mutex mutex;
+    std::unordered_map<void *, size_t> mapped; // ptr -> mapped size of the blocks from mmap
+    std::vector<std::pair<void *, size_t>> free_blocks;
+    size_t free_bytes = 0;
+    size_t limit      = [] {
+        const char * value = getenv("COMMON_STATE_POOL_MIB");
+        return (size_t) (value ? std::max(0, atoi(value)) : 1024) << 20;
+    }();
+};
+
+common_state_pool & state_pool() {
+    static common_state_pool * pool = new common_state_pool(); // never destroyed: buffers may outlive static teardown
+    return *pool;
+}
+
+constexpr size_t state_large_size = 4u << 20;
+}
+
+void * common_state_alloc(size_t size) {
+#if defined(__linux__)
+    if (size >= state_large_size) {
+        auto & pool = state_pool();
+        {
+            std::lock_guard<std::mutex> lock(pool.mutex);
+            // reuse a freed block that is not much larger than needed
+            for (size_t i = 0; i < pool.free_blocks.size(); ++i) {
+                auto [ptr, len] = pool.free_blocks[i];
+                if (len >= size && len - size <= size / 4) {
+                    pool.free_blocks.erase(pool.free_blocks.begin() + i);
+                    pool.free_bytes -= len;
+                    return ptr;
+                }
+            }
+        }
+        const size_t len = GGML_PAD(size, 2u << 20);
+        void * ptr = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ptr == MAP_FAILED) {
+            throw std::bad_alloc();
+        }
+        madvise(ptr, len, MADV_HUGEPAGE);
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        pool.mapped[ptr] = len;
+        return ptr;
+    }
+#endif
+    return ::operator new(size);
+}
+
+void common_state_free(void * ptr, size_t size) noexcept {
+    if (ptr == nullptr) {
+        return;
+    }
+#if defined(__linux__)
+    if (size >= state_large_size) {
+        auto & pool = state_pool();
+        std::lock_guard<std::mutex> lock(pool.mutex);
+        auto it = pool.mapped.find(ptr);
+        if (it != pool.mapped.end()) {
+            const size_t len = it->second;
+            if (pool.free_bytes + len <= pool.limit) {
+                pool.free_blocks.emplace_back(ptr, len);
+                pool.free_bytes += len;
+            } else {
+                pool.mapped.erase(it);
+                munmap(ptr, len);
+            }
+            return;
+        }
+    }
+#endif
+    ::operator delete(ptr);
 }
 
 void common_prompt_checkpoint::update_tgt(

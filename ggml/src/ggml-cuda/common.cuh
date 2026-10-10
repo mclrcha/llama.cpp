@@ -1667,6 +1667,74 @@ struct ggml_hip_mmq_cache {
 };
 #endif
 
+#if defined(GGML_USE_HIP)
+// MUL_MAT_ID prefill: the gate and up projections of a MoE layer share the expert routing and the broadcast activations,
+// so the second one reuses the expert maps and the quantized activations of the first (GGML_HIP_MMQ_IDS_CACHE=0 off).
+struct ggml_hip_mmq_ids_cache {
+    void *  data = nullptr;
+    size_t  size = 0;
+    bool    valid = false;
+    const ggml_tensor * ids  = nullptr;
+    const ggml_tensor * src1 = nullptr;
+    int64_t key[8] = {0};
+
+    // returns nullptr when the buffer cannot grow (stream capture)
+    char * get(size_t nbytes, cudaStream_t stream) {
+        if (size < nbytes) {
+            hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+            CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+            if (status != hipStreamCaptureStatusNone) {
+                return nullptr;
+            }
+            if (data) {
+                CUDA_CHECK(cudaFree(data));
+            }
+            CUDA_CHECK(cudaMalloc(&data, nbytes));
+            size = nbytes;
+        }
+        return static_cast<char *>(data);
+    }
+
+    bool hit(const ggml_tensor * ids_, const ggml_tensor * src1_, const int64_t (&key_)[8]) const {
+        if (!valid || !ggml_hip_mmvq_cache::same_data(ids, ids_) || !ggml_hip_mmvq_cache::same_data(src1, src1_)) {
+            return false;
+        }
+        for (int i = 0; i < 8; ++i) {
+            if (key[i] != key_[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void set(const ggml_tensor * ids_, const ggml_tensor * src1_, const int64_t (&key_)[8]) {
+        ids  = ids_;
+        src1 = src1_;
+        for (int i = 0; i < 8; ++i) {
+            key[i] = key_[i];
+        }
+        valid = true;
+    }
+
+    void reset() {
+        valid = false;
+    }
+
+    void invalidate_write(const ggml_tensor * dst) {
+        if (!valid) {
+            return;
+        }
+        const uintptr_t b = reinterpret_cast<uintptr_t>(dst->data);
+        for (const ggml_tensor * t : {ids, src1}) {
+            const uintptr_t a = reinterpret_cast<uintptr_t>(t->data);
+            if (a < b + ggml_nbytes(dst) && b < a + ggml_nbytes(t)) {
+                valid = false;
+            }
+        }
+    }
+};
+#endif
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1682,6 +1750,7 @@ struct ggml_backend_cuda_context {
 #if defined(GGML_USE_HIP)
     ggml_hip_mmvq_cache mmvq_cache;
     ggml_hip_mmq_cache  mmq_cache;
+    ggml_hip_mmq_ids_cache mmq_ids_cache;
     // GATED_DELTA_NET nodes whose initial state gather (GET_ROWS of the recurrent cache) was skipped: the op reads the
     // state from the cache row instead. Filled and consumed during one graph evaluation.
     std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_deferred_gather;

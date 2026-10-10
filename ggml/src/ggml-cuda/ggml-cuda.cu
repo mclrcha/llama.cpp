@@ -5745,6 +5745,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     for (int j = i; j <= i + nodes_to_skip; ++j) {
                         cuda_ctx->mmvq_cache.invalidate_write(cgraph->nodes[j]);
                         cuda_ctx->mmq_cache.invalidate_write(cgraph->nodes[j]);
+                        cuda_ctx->mmq_ids_cache.invalidate_write(cgraph->nodes[j]);
                     }
                     cuda_ctx->mmvq_cache.commit();
                     cuda_ctx->mmq_cache.commit();
@@ -5791,6 +5792,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #if defined(GGML_USE_HIP)
                 cuda_ctx->mmvq_cache.invalidate_write(node);
                 cuda_ctx->mmq_cache.invalidate_write(node);
+                cuda_ctx->mmq_ids_cache.invalidate_write(node);
 #endif
 
                 if (!is_concurrent_event_active) {
@@ -5863,6 +5865,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     auto & cache = cuda_ctx->mmvq_cache;
     cache.reset();
     cuda_ctx->mmq_cache.reset();
+    cuda_ctx->mmq_ids_cache.reset();
     cuda_ctx->gdn_deferred_gather.clear();
     cache.enabled = !disable_mmvq_cache && cuda_ctx->stream_context().concurrent_events.empty() &&
                     GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[cuda_ctx->device].cc);

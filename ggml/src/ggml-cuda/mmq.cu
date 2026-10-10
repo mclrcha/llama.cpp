@@ -328,26 +328,69 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne_get_rows = ne12 * n_expert_used;
     GGML_ASSERT(ne1 == n_expert_used);
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
-    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
-
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
     // scatter to its slots. ids_src1 then holds the inverse map (token slot -> compact row).
     const bool dedup_bcast = ne11 == 1 && n_expert_used > 1;
 
-    {
-        GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
-        const int si1  = ids->nb[1] / ggml_element_size(ids);
-        const int sis1 = nb12 / nb11;
+    GGML_ASSERT(ids->nb[0] == ggml_element_size(ids));
+    const int si1  = ids->nb[1] / ggml_element_size(ids);
+    const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool());
+    ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool());
+    ggml_cuda_pool_alloc<char>    src1_q8_1(ctx.pool());
+
+    int32_t * ids_src1_d      = nullptr;
+    int32_t * ids_dst_d       = nullptr;
+    int32_t * expert_bounds_d = nullptr;
+    char    * src1_q8_1_d     = nullptr;
+    bool      prep_cached     = false; // expert maps and quantized activations come from the previous projection
+
+#if defined(GGML_USE_HIP)
+    static const bool ids_cache_enabled = [] {
+        const char * value = getenv("GGML_HIP_MMQ_IDS_CACHE");
+        return !value || std::atoi(value) != 0;
+    }();
+    if (ids_cache_enabled && dedup_bcast && !use_native_fp4 && ctx.mmvq_cache.enabled && ctx.curr_stream_no == 0) {
+        const int64_t key[8] = { ne02, ne12, n_expert_used, ne11, si1, sis1, (int64_t) mmq_get_q8_1_ds_layout(src0->type), ne10_padded };
+        // sized for the largest tile so that projections with another J_best can share the buffers
+        const size_t n_src1  = GGML_PAD(ne_get_rows*sizeof(int32_t), 256);
+        const size_t n_dst   = GGML_PAD((ne_get_rows + 128)*sizeof(int32_t), 256);
+        const size_t n_bnds  = GGML_PAD((ne02 + 1)*sizeof(int32_t), 256);
+        const size_t n_q8    = ne12*n_expert_used*ne10_padded * sizeof(block_q8_1_mmq)/QK8_1_MMQ +
+            GGML_PAD(128*sizeof(block_q8_1_mmq), 512*sizeof(int));
+        GGML_ASSERT(n_q8 >= nbytes_src1_q8_1);
+        auto & cache = ctx.mmq_ids_cache;
+        const bool hit = cache.hit(ids, src1, key) && cache.size >= n_src1 + n_dst + n_bnds + n_q8;
+        char * buf = hit ? static_cast<char *>(cache.data) : cache.get(n_src1 + n_dst + n_bnds + n_q8, stream);
+        if (buf) {
+            ids_src1_d      = (int32_t *) buf;
+            ids_dst_d       = (int32_t *) (buf + n_src1);
+            expert_bounds_d = (int32_t *) (buf + n_src1 + n_dst);
+            src1_q8_1_d     = buf + n_src1 + n_dst + n_bnds;
+            prep_cached     = hit;
+            if (!hit) {
+                cache.set(ids, src1, key);
+            }
+        }
+    }
+#endif
+    if (!ids_src1_d) {
+        ids_src1_d      = ids_src1.alloc(ne_get_rows);
+        ids_dst_d       = ids_dst.alloc(ne_get_rows + J_best-1); // Needs to be padded for unconditional memory access.
+        expert_bounds_d = expert_bounds.alloc(ne02 + 1);
+        src1_q8_1_d     = src1_q8_1.alloc(nbytes_src1_q8_1);
+    }
+
+    if (!prep_cached) {
+        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1_d, ids_dst_d, expert_bounds_d,
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
         src1_scale.alloc(ne12*n_expert_used);
@@ -357,7 +400,7 @@ void ggml_cuda_mul_mat_q(
     const int64_t ne12_flat = 1;
     const int64_t ne13_flat = 1;
 
-    {
+    if (!prep_cached) {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
@@ -366,22 +409,22 @@ void ggml_cuda_mul_mat_q(
             static constexpr size_t align_float8 = 32;
             const bool use_aligned_float8 = ggml_cuda_is_aligned(src1, align_float8);
             if (dedup_bcast) {
-                quantize_scatter_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10,
+                quantize_scatter_mmq_fp4_cuda(src1_d, ids_src1_d, src1_q8_1_d, src1_scale.ptr, src0->type, use_aligned_float8, ne10,
                                         /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
             } else {
-                quantize_mmq_fp4_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
+                quantize_mmq_fp4_cuda(src1_d, ids_src1_d, src1_q8_1_d, src1_scale.ptr, src0->type, use_aligned_float8, ne10, s11, s12, s13,
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
-            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1_d, src1_q8_1_d, src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
 #if defined(GGML_USE_HIP)
         } else if (silu_gate) {
             quantize_mmq_silu_cuda((const float *) silu_gate->data, (const float *) silu_up->data,
-                src1_q8_1.get(), src0->type, ne10, ne11_flat, stream, ids_src1.get());
+                src1_q8_1_d, src0->type, ne10, ne11_flat, stream, ids_src1_d);
 #endif
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            quantize_mmq_q8_1_cuda(src1_d, ids_src1_d, src1_q8_1_d, src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -394,7 +437,7 @@ void ggml_cuda_mul_mat_q(
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1_d, ids_dst_d, expert_bounds_d, dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,

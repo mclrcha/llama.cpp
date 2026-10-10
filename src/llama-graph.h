@@ -146,6 +146,9 @@ public:
 
     float scale_tok = 1.0f;
 
+    // the mixed path is only built for mixed ubatches (LLAMA_EMBD_MIXED_LAZY=0 builds it for every ubatch)
+    bool mixed_lazy = false;
+
     const int64_t n_embd = 0;
 };
 

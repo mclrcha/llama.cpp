@@ -41,7 +41,10 @@ static __global__ void norm_f32(
 
             if constexpr (block_size > WARP_SIZE) {
                 // sync is needed as we reuse s_sum2 across block_reduce invocations, see #26385
-                __syncthreads();
+                // only when this block runs another iteration: a block that is done can retire right away
+                if (channel + (int) gridDim.y < nchannels || sample + (int) gridDim.z < nsamples) {
+                    __syncthreads();
+                }
             }
         }
     }
@@ -173,7 +176,10 @@ static __global__ void rms_norm_f32(const float * x,
 
             if constexpr (block_size > WARP_SIZE) {
                 // sync is needed as we reuse s_sum across block_reduce invocations, see #26385
-                __syncthreads();
+                // only when this block runs another iteration: a block that is done can retire right away
+                if (channel + (int) gridDim.y < nchannels || sample + (int) gridDim.z < nsamples) {
+                    __syncthreads();
+                }
             }
         }
     }
@@ -303,7 +309,10 @@ static __global__ void l2_norm_f32(
 
             if constexpr (block_size > WARP_SIZE) {
                 // sync is needed as we reuse s_sum across block_reduce invocations, see #26385
-                __syncthreads();
+                // only when this block runs another iteration: a block that is done can retire right away
+                if (channel + (int) gridDim.y < nchannels || sample + (int) gridDim.z < nsamples) {
+                    __syncthreads();
+                }
             }
         }
     }

@@ -761,6 +761,73 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+#if defined(GGML_USE_HIP)
+/* gated op that also writes the Q8_1 copy of its output for a following matrix-vector product */
+
+// dst = op(x) * g for nrows x nc values; the Q8_1 copy follows the consumer's view of dst: rows of K values padded to
+// K_padded, the layout and values of quantize_q8_1 on the stored dst.
+template <float (*op)(float)>
+static __global__ void unary_gated_q8_1_kernel(const float * x, const float * g, float * dst, block_q8_1 * y,
+        const int64_t nc, const int64_t o0, const int64_t o1, const int64_t K, const int64_t K_padded,
+        const int64_t x_inner, const int64_t x_s_inner) {
+    const int64_t c = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    const int64_t r = blockIdx.y;
+
+    float xi = 0.0f;
+    if (c < K) {
+        const int64_t e  = r*K + c;
+        const int64_t gr = e / nc;
+        const int64_t gc = e - gr*nc;
+        {
+#pragma clang fp contract(off)
+            // the unfused path stores the product: no contraction into the block sum below
+            // x rows may be a strided view of x_inner-value pieces (the copy of a non-contiguous gate is folded in)
+            const int64_t xp = gc / x_inner;
+            xi = op(x[gr*o0 + xp*x_s_inner + (gc - xp*x_inner)]) * g[gr*o1 + gc];
+        }
+        dst[e] = xi;
+    }
+
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+
+    const int64_t i_cont = r*K_padded + c;
+    block_q8_1 * b = y + i_cont/QK8_1;
+    b->qs[i_cont % QK8_1] = q;
+    if (i_cont % QK8_1 == 0) {
+        b->ds = make_half2(d, sum);
+    }
+}
+
+void ggml_cuda_unary_gated_q8_1(ggml_unary_op op, const float * x, const float * g, float * dst, void * q8,
+        const int64_t nc, const int64_t o0, const int64_t o1, const int64_t K, const int64_t nrows_K, cudaStream_t stream,
+        const int64_t x_inner, const int64_t x_s_inner) {
+    const int64_t K_padded = GGML_PAD(K, MATRIX_ROW_PADDING);
+    GGML_ASSERT(K_padded % CUDA_GLU_BLOCK_SIZE == 0 && CUDA_GLU_BLOCK_SIZE % QK8_1 == 0);
+    const dim3 grid(K_padded/CUDA_GLU_BLOCK_SIZE, nrows_K);
+    block_q8_1 * y = (block_q8_1 *) q8;
+    switch (op) {
+        case GGML_UNARY_OP_SILU:
+            unary_gated_q8_1_kernel<op_silu><<<grid, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, y, nc, o0, o1, K, K_padded,
+                x_inner > 0 ? x_inner : nc, x_s_inner);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            unary_gated_q8_1_kernel<op_sigmoid><<<grid, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, y, nc, o0, o1, K, K_padded,
+                x_inner > 0 ? x_inner : nc, x_s_inner);
+            break;
+        default:
+            GGML_ABORT("unsupported op");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif // defined(GGML_USE_HIP)
+
 /* fused relu + sqr */
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {

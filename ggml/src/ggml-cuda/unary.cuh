@@ -93,6 +93,15 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
 
+#if defined(GGML_USE_HIP)
+// dst = op(x) * g (op SILU or SIGMOID, nc values per row, row strides o0/o1 in floats) plus the Q8_1 copy of dst seen as
+// nrows_K rows of K values, as quantize_q8_1 writes it for the matrix-vector product. x_inner > 0: each x row is a view
+// of pieces of x_inner contiguous values x_s_inner floats apart.
+void ggml_cuda_unary_gated_q8_1(ggml_unary_op op, const float * x, const float * g, float * dst, void * q8,
+        int64_t nc, int64_t o0, int64_t o1, int64_t K, int64_t nrows_K, cudaStream_t stream,
+        int64_t x_inner = 0, int64_t x_s_inner = 0);
+#endif
+
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
 
 __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {

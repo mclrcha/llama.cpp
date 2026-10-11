@@ -4972,6 +4972,175 @@ static int ggml_cuda_try_conv_prefill(ggml_backend_cuda_context & ctx,ggml_cgrap
 }
 #endif
 
+#if defined(GGML_USE_HIP)
+// Decode: a gated activation (SWIGLU, or the fused unary * mul) whose output feeds a matrix-vector product writes the Q8_1
+// copy of its output into the MMVQ cache in the same kernel, and the product skips quantize_q8_1 (one kernel less per
+// FFN and per attention output gate). Values are those of quantize_q8_1 on the stored output. GGML_HIP_GLU_Q8=0 disables.
+// Returns the graph index of the consuming MUL_MAT and its Q8_1 cache slot (reserved for the consumer's view of act).
+static void * ggml_cuda_glu_q8_slot(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i, const ggml_tensor * act,
+        int & i_mm, int64_t & K, int64_t & nrows_K) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_HIP_GLU_Q8");
+        return !value || std::atoi(value) != 0;
+    }();
+    if (!enabled || ctx.curr_stream_no != 0 || !ctx.mmvq_cache.enabled || !ctx.stream_context().concurrent_events.empty() ||
+            !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc)) {
+        return nullptr;
+    }
+    if (act->type != GGML_TYPE_F32 || !ggml_is_contiguous(act) || !act->buffer ||
+            act->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) {
+        return nullptr;
+    }
+    int j = i + 1;
+    while (j < graph->n_nodes && j <= i + 4 && ggml_cuda_is_view_or_noop(graph->nodes[j])) {
+        ++j;
+    }
+    if (j >= graph->n_nodes || j > i + 4) {
+        return nullptr;
+    }
+    const ggml_tensor * mm = graph->nodes[j];
+    if (mm->op != GGML_OP_MUL_MAT || (mm->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || !ggml_is_quantized(mm->src[0]->type)) {
+        return nullptr;
+    }
+    const ggml_tensor * src1 = mm->src[1];
+    const bool view_of_act = src1 == act ||
+        (src1->view_src == act && src1->view_offs == 0 && ggml_nelements(src1) == ggml_nelements(act));
+    if (!view_of_act || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) || src1->ne[0] % QK8_1 != 0 ||
+            src1->ne[1] > MMVQ_MAX_BATCH_SIZE || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return nullptr;
+    }
+    const int64_t K_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    if (size_t(src1->ne[1])*(K_padded/QK8_1)*sizeof(block_q8_1) > ctx.mmvq_cache.capacity) {
+        return nullptr;
+    }
+    i_mm    = j;
+    K       = src1->ne[0];
+    nrows_K = src1->ne[1];
+    return ctx.mmvq_cache.reserve(src1);
+}
+
+static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i);
+
+// SWIGLU: the slot is committed right away and the product (or a fusion starting there) runs here.
+static int ggml_cuda_try_swiglu_q8(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    ggml_tensor * glu = graph->nodes[i];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU) {
+        return 0;
+    }
+    const ggml_tensor * src0 = glu->src[0];
+    const ggml_tensor * src1 = glu->src[1];
+    if (src0->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src0) || src0->nb[0] != sizeof(float) ||
+            (src1 && (src1->type != GGML_TYPE_F32 || !ggml_is_contiguous_1(src1) || src1->nb[0] != sizeof(float) ||
+                      src1->ne[0] != src0->ne[0]))) {
+        return 0;
+    }
+    int i_mm = 0;
+    int64_t K = 0, nrows_K = 0;
+    void * q8 = ggml_cuda_glu_q8_slot(ctx, graph, i, glu, i_mm, K, nrows_K);
+    if (!q8) {
+        return 0;
+    }
+    // as ggml_cuda_op_unary_gated
+    const int64_t nc = src1 ? src0->ne[0] : src0->ne[0]/2;
+    const float * x = (const float *) src0->data;
+    const float * g = src1 ? (const float *) src1->data : (const float *) src0->data;
+    if (!src1) {
+        const int32_t swapped = ((const int32_t *) glu->op_params)[1];
+        x += swapped ? nc : 0;
+        g += swapped ? 0 : nc;
+    }
+    const int64_t o0 = src0->nb[1]/sizeof(float);
+    const int64_t o1 = src1 ? src1->nb[1]/sizeof(float) : o0;
+    ggml_cuda_unary_gated_q8_1(GGML_UNARY_OP_SILU, x, g, (float *) glu->data, q8, nc, o0, o1, K, nrows_K, ctx.stream());
+    ctx.mmvq_cache.invalidate_write(glu);
+    ctx.mmvq_cache.commit();
+
+    ggml_tensor * mm = graph->nodes[i_mm];
+    const int n = ggml_cuda_try_fuse(&ctx, graph, i_mm);
+    if (n == 0) {
+        GGML_ASSERT(ggml_cuda_compute_forward(ctx, mm));
+    }
+    return i_mm - i + n;
+}
+
+// UNARY (SILU/SIGMOID) * MUL fused: the graph loop commits the slot after the two nodes.
+static bool ggml_cuda_try_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    const ggml_tensor * unary = graph->nodes[i];
+    ggml_tensor * mul = graph->nodes[i + 1];
+    const ggml_unary_op op = ggml_get_unary_op(unary);
+    if (op != GGML_UNARY_OP_SILU && op != GGML_UNARY_OP_SIGMOID) {
+        return false;
+    }
+    const ggml_tensor * x = unary->src[0];
+    const ggml_tensor * g = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+    if (x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(x, g) ||
+            !ggml_are_same_shape(x, mul) || !ggml_is_contiguous_1(x) || !ggml_is_contiguous_1(g) ||
+            x->nb[0] != sizeof(float) || g->nb[0] != sizeof(float) || ggml_nrows(x) != x->ne[1]) {
+        return false;
+    }
+    int i_mm = 0;
+    int64_t K = 0, nrows_K = 0;
+    void * q8 = ggml_cuda_glu_q8_slot(ctx, graph, i + 1, mul, i_mm, K, nrows_K);
+    if (!q8) {
+        return false;
+    }
+    ggml_cuda_unary_gated_q8_1(op, (const float *) x->data, (const float *) g->data, (float *) mul->data, q8,
+        x->ne[0], x->nb[1]/sizeof(float), g->nb[1]/sizeof(float), K, nrows_K, ctx.stream());
+    return true;
+}
+
+// CONT of a strided view (Qwen3.x attention gate, interleaved with Q in one projection) + UNARY * MUL: the gated kernel
+// reads the view directly, the copy is not materialized.
+static int ggml_cuda_try_cont_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    ggml_tensor * cont = graph->nodes[i];
+    if (cont->op != GGML_OP_CONT || i + 2 >= graph->n_nodes) {
+        return 0;
+    }
+    const ggml_tensor * unary = graph->nodes[i + 1];
+    ggml_tensor * mul = graph->nodes[i + 2];
+    if (unary->op != GGML_OP_UNARY || unary->src[0] != cont || mul->op != GGML_OP_MUL ||
+            (mul->src[0] != unary && mul->src[1] != unary)) {
+        return 0;
+    }
+    const ggml_unary_op op = ggml_get_unary_op(unary);
+    if (op != GGML_UNARY_OP_SILU && op != GGML_UNARY_OP_SIGMOID) {
+        return 0;
+    }
+    const ggml_tensor * view = cont->src[0];
+    const ggml_tensor * g = mul->src[0] == unary ? mul->src[1] : mul->src[0];
+    // view [inner, pieces, rows] -> cont [inner*pieces, rows]
+    if (view->type != GGML_TYPE_F32 || cont->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            view->nb[0] != sizeof(float) || view->nb[1] % sizeof(float) || view->nb[2] % sizeof(float) || view->ne[3] != 1 ||
+            cont->ne[2] != 1 || cont->ne[3] != 1 || view->ne[0]*view->ne[1] != cont->ne[0] || view->ne[2] != cont->ne[1] ||
+            !ggml_are_same_shape(cont, g) || !ggml_are_same_shape(cont, mul) || !ggml_is_contiguous_1(g) ||
+            g->nb[0] != sizeof(float) || !view->buffer || view->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) {
+        return 0;
+    }
+    const int out = i + 2;
+    if (!ggml_can_fuse_subgraph(graph, i, {GGML_OP_CONT, GGML_OP_UNARY, GGML_OP_MUL}, {out})) {
+        return 0;
+    }
+    const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t x = reinterpret_cast<uintptr_t>(a->data), y = reinterpret_cast<uintptr_t>(b->data);
+        return x < y + ggml_nbytes(b) && y < x + ggml_nbytes(a);
+    };
+    const ggml_tensor * vsrc = view->view_src ? view->view_src : view;
+    if (overlaps(mul, vsrc) || (overlaps(mul, g) && mul->data != g->data)) {
+        return 0;
+    }
+    int i_mm = 0;
+    int64_t K = 0, nrows_K = 0;
+    void * q8 = ggml_cuda_glu_q8_slot(ctx, graph, i + 2, mul, i_mm, K, nrows_K);
+    if (!q8) {
+        return 0;
+    }
+    ggml_cuda_unary_gated_q8_1(op, (const float *) view->data, (const float *) g->data, (float *) mul->data, q8,
+        cont->ne[0], view->nb[2]/sizeof(float), g->nb[1]/sizeof(float), K, nrows_K, ctx.stream(),
+        view->ne[0], view->nb[1]/sizeof(float));
+    return 2;
+}
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4984,6 +5153,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #if defined(GGML_USE_HIP)
     const int prefill_silu_skip=ggml_cuda_try_prefill_silu_quant(*cuda_ctx,cgraph,i);
     if(prefill_silu_skip) { return prefill_silu_skip; }
+    const int swiglu_q8_skip = ggml_cuda_try_swiglu_q8(*cuda_ctx, cgraph, i);
+    if (swiglu_q8_skip) { return swiglu_q8_skip; }
+    const int cont_q8_skip = ggml_cuda_try_cont_unary_mul_q8(*cuda_ctx, cgraph, i);
+    if (cont_q8_skip) { return cont_q8_skip; }
     const int prefill_conv_skip=ggml_cuda_try_conv_prefill(*cuda_ctx,cgraph,i);
     if(prefill_conv_skip) { return prefill_conv_skip; }
     const int q8_pair_skip=ggml_cuda_try_q8_pair(*cuda_ctx,cgraph,i);
@@ -5806,6 +5979,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+#if defined(GGML_USE_HIP)
+        if (ggml_cuda_try_unary_mul_q8(*cuda_ctx, cgraph, i)) {
+            return 1;
+        }
+#endif
         ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }

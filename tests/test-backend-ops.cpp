@@ -9960,11 +9960,13 @@ static const ggml_type other_types[] = {
 static void add_qwen_kv_cases(std::vector<std::unique_ptr<test_case>> & cases, bool perf) {
     for (int nh : {2, 4}) {
         const int gqa = nh == 2 ? 8 : 6;
-        for (int kv : {512, 8192, 32768}) {
-            if (!perf && kv == 32768) { continue; }
+        for (int kv : {512, 8192, 32768, 131072}) {
+            if (!perf && kv >= 32768) { continue; }
+            if (kv == 131072 && nh != 4) { continue; }
             for (int nb : {1, 2, 3, 4, 5}) {
                 for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
                     if (nh == 2 && type == GGML_TYPE_Q8_0) { continue; }
+                    if (kv == 131072 && (nb < 3 || type != GGML_TYPE_Q8_0)) { continue; }
                     cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {gqa, 1}, kv, nb, true, false, 0, 0,
                         GGML_PREC_F32, type, type, {0, 2, 1, 3}));
                 }

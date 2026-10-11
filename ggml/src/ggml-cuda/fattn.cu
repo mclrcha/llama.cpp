@@ -762,9 +762,17 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
+            if (ggml_cuda_flash_attn_ext_rdna4_dec_supported(ggml_cuda_get_device(), dst)) {
+                ggml_cuda_flash_attn_ext_rdna4_dec(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_tile(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_VEC:
+            if (ggml_cuda_flash_attn_ext_rdna4_dec_supported(ggml_cuda_get_device(), dst)) {
+                ggml_cuda_flash_attn_ext_rdna4_dec(ctx, dst);
+                break;
+            }
             ggml_cuda_flash_attn_ext_vec(ctx, dst);
             break;
         case BEST_FATTN_KERNEL_MMA_F16:

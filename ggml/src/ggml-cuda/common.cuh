@@ -1292,6 +1292,7 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     int  n_stable = 0; // replays since the last property change
+    int64_t capture_ne[GGML_MAX_DIMS] = {0}; // shape of the first node at the last capture
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {

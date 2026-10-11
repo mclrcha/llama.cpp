@@ -6141,12 +6141,15 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #if defined(GGML_USE_HIP)
                 // A graph that replayed several times and then changed (the KV cache grew by a padding step) is
                 // captured again right away instead of being evaluated once without a graph first; graphs that keep
-                // changing still take the warmup path (GGML_HIP_GRAPH_RECAPTURE=0 off).
+                // changing still take the warmup path (GGML_HIP_GRAPH_RECAPTURE=0 off). Only for the same batch (shape
+                // of the first node): a new batch size can reach BLAS shapes that hipBLASLt must not initialize while
+                // the stream is being captured.
                 static const bool recapture = [] {
                     const char * value = getenv("GGML_HIP_GRAPH_RECAPTURE");
                     return !value || atoi(value) != 0;
                 }();
-                if (properties_changed && recapture && graph->n_stable >= 4 && graph->instance != nullptr) {
+                const bool same_batch = memcmp(graph->capture_ne, cgraph->nodes[0]->ne, sizeof(graph->capture_ne)) == 0;
+                if (properties_changed && recapture && same_batch && graph->n_stable >= 4 && graph->instance != nullptr) {
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
                     graph->n_stable = 0;
@@ -6189,6 +6192,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #endif
 
     if (use_cuda_graph && cuda_graph_update_required) {
+#if defined(GGML_USE_HIP) && defined(USE_CUDA_GRAPH)
+        memcpy(cuda_ctx->cuda_graph(graph_key)->capture_ne, cgraph->nodes[0]->ne, sizeof(cgraph->nodes[0]->ne));
+#endif
         // Start CUDA graph capture
         {
             std::lock_guard<std::mutex> lock(ggml_cuda_lock);

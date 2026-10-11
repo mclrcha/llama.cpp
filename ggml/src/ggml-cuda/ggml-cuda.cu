@@ -4672,8 +4672,9 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
     const ggml_tensor *qnorm=nullptr;
     ggml_tensor *qout=nullptr,*kout=nullptr;
     int last=conv_idx+1;
-    // Q/K RMS norm + scale in the same kernel; several tokens (speculative verification) with GGML_HIP_CONV_PREPARE_QK=0 off
-    static const bool qk_batch=[] { const char *v=getenv("GGML_HIP_CONV_PREPARE_QK");return !v || std::atoi(v)!=0; }();
+    // Q/K RMS norm + scale in the same kernel. Several tokens: off by default (GGML_HIP_CONV_PREPARE_QK=1 on), the batched
+    // kernel is not bit-identical to the unfused norms (KLD 0.0018 at ubatch 4); one token is.
+    static const bool qk_batch=[] { const char *v=getenv("GGML_HIP_CONV_PREPARE_QK");return v && std::atoi(v)!=0; }();
     if((n_tokens==1 || qk_batch) && mode>=2 && conv_idx+7<graph->n_nodes) {
         auto *qview=graph->nodes[conv_idx+2];auto *qn=graph->nodes[conv_idx+3];auto *qs=graph->nodes[conv_idx+4];
         auto *kview=graph->nodes[conv_idx+5];auto *kn=graph->nodes[conv_idx+6];auto *ks=graph->nodes[conv_idx+7];

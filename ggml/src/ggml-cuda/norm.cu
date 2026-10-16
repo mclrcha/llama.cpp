@@ -433,6 +433,14 @@ static void rms_norm_f32_dispatch(
         vec = vec && add_ncols_packed.z == (uint32_t) ncols
             && ggml_cuda_is_aligned(add_t, 16);
     }
+#if defined(GGML_USE_HIP)
+    // GGML_HIP_RMS_NORM_VEC=0: strided kernel of before #29720 (its reduction order and block size, outputs of r77)
+    static const bool hip_vec = [] {
+        const char * value = getenv("GGML_HIP_RMS_NORM_VEC");
+        return !value || atoi(value) != 0;
+    }();
+    vec = vec && hip_vec;
+#endif
 
     const int n4 = ncols / 4;
     if (vec) {

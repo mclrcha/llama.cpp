@@ -434,10 +434,11 @@ static void rms_norm_f32_dispatch(
             && ggml_cuda_is_aligned(add_t, 16);
     }
 #if defined(GGML_USE_HIP)
-    // GGML_HIP_RMS_NORM_VEC=0: strided kernel of before #29720 (its reduction order and block size, outputs of r77)
+    // strided kernel of before #29720 by default (its reduction order and block size, outputs of r77);
+    // GGML_HIP_RMS_NORM_VEC=1 takes the float4 kernels (other rounding, ~0.25% faster dense decode)
     static const bool hip_vec = [] {
         const char * value = getenv("GGML_HIP_RMS_NORM_VEC");
-        return !value || atoi(value) != 0;
+        return value && atoi(value) != 0;
     }();
     vec = vec && hip_vec;
 #endif

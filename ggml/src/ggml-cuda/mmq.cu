@@ -607,6 +607,36 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             }
         }
 
+        // Dense K-quant matrices with at least GGML_HIP_BLAS_MIN_BATCH (1024) columns are dequantized to f16 and multiplied with
+        // f32 accumulation (mmdq-rdna4.cu, or hipBLAS for shapes it does not cover): the per-sub-block scale epilogue keeps
+        // their MMQ well below the f16 WMMA rate, and f16 activations are more precise than q8_1.
+        // GGML_HIP_BLAS_TYPES overrides the type list (comma separated, "none" = always MMQ).
+        static const std::array<bool, GGML_TYPE_COUNT> blas_types = [] {
+            std::array<bool, GGML_TYPE_COUNT> sel{};
+            const char * e = getenv("GGML_HIP_BLAS_TYPES");
+            const std::string s = e ? e : "q4_K,q5_K,q6_K";
+            for (size_t p = 0; p < s.size();) {
+                size_t q = s.find(',', p);
+                q = q == std::string::npos ? s.size() : q;
+                const std::string name = s.substr(p, q - p);
+                for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+                    const char * tn = ggml_type_name((ggml_type) t);
+                    if (tn && name == tn) {
+                        sel[t] = true;
+                    }
+                }
+                p = q + 1;
+            }
+            return sel;
+        }();
+        static const int64_t blas_min_batch = [] {
+            const char * e = getenv("GGML_HIP_BLAS_MIN_BATCH");
+            return e ? (int64_t) atoll(e) : (int64_t) 1024;
+        }();
+        if (blas_types[type] && n_experts == 0 && ne11 >= blas_min_batch) {
+            return false;
+        }
+
         // For RDNA4 MMQ is consistently faster than dequantization + hipBLAS:
         // https://github.com/ggml-org/llama.cpp/pull/18537#issuecomment-3706422301
         return true;

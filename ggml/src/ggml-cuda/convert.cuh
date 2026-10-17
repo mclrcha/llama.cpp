@@ -16,6 +16,11 @@ to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
 
+#if defined(GGML_USE_HIP)
+// f32 -> f16 saturating at +-65504 (activations of quantized weights in the dequantize + hipBLAS path)
+void ggml_cuda_convert_f32_f16_sat(const float * x, half * y, int64_t k, cudaStream_t stream);
+#endif // defined(GGML_USE_HIP)
+
 // TODO more general support for non-contiguous inputs
 
 template<typename T>

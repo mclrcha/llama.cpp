@@ -493,6 +493,44 @@ static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k,
     convert_unary_cuda<src_t>(vx, y, k, 1, 1, 1, k, k, k, stream);
 }
 
+#if defined(GGML_USE_HIP)
+// f32 -> f16 that saturates at +-65504 instead of overflowing to inf (NaN stays NaN); in-range values round as convert_unary.
+static __device__ __forceinline__ half ggml_cuda_f32_f16_sat(const float x) {
+    return ggml_cuda_cast<half>(x > 65504.0f ? 65504.0f : (x < -65504.0f ? -65504.0f : x));
+}
+
+static __global__ void convert_f32_f16_sat(const float * __restrict__ x, half * __restrict__ y, const int64_t k) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+    if (i < k) {
+        y[i] = ggml_cuda_f32_f16_sat(x[i]);
+    }
+}
+
+static __global__ void convert_f32_f16_sat_vec4(const cvt_vec4<float> * __restrict__ x, cvt_vec4<half> * __restrict__ y, const int64_t k4) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+    if (i >= k4) {
+        return;
+    }
+    const cvt_vec4<float> xv = x[i];
+    cvt_vec4<half> yv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        yv.v[j] = ggml_cuda_f32_f16_sat(xv.v[j]);
+    }
+    y[i] = yv;
+}
+
+void ggml_cuda_convert_f32_f16_sat(const float * x, half * y, const int64_t k, cudaStream_t stream) {
+    if (k % 4 == 0 && (uintptr_t) x % alignof(cvt_vec4<float>) == 0 && (uintptr_t) y % alignof(cvt_vec4<half>) == 0) {
+        const int64_t k4 = k/4;
+        convert_f32_f16_sat_vec4<<<(k4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(
+            (const cvt_vec4<float> *) x, (cvt_vec4<half> *) y, k4);
+        return;
+    }
+    convert_f32_f16_sat<<<(k + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(x, y, k);
+}
+#endif // defined(GGML_USE_HIP)
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q1_0:

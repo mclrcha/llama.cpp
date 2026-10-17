@@ -29,6 +29,7 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/mmdq-rdna4.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -1548,9 +1549,21 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
         src1_alloc.alloc(ggml_nelements(src1));
 
         if (ggml_is_contiguously_allocated(src1)) {
-            const auto convert_func = traits::convert(src1->type);
-            GGML_ASSERT(convert_func != nullptr);
-            convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
+            bool converted = false;
+#if defined(GGML_USE_HIP)
+            // quantized weights replacing MMQ: activations saturate instead of overflowing to inf
+            if constexpr (compute_type == GGML_TYPE_F16) {
+                if (src1->type == GGML_TYPE_F32 && ggml_is_quantized(src0->type)) {
+                    ggml_cuda_convert_f32_f16_sat((const float *) src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
+                    converted = true;
+                }
+            }
+#endif // defined(GGML_USE_HIP)
+            if (!converted) {
+                const auto convert_func = traits::convert(src1->type);
+                GGML_ASSERT(convert_func != nullptr);
+                convert_func(src1->data, src1_alloc.get(), ggml_nelements(src1), main_stream);
+            }
             const size_t src1_bs = ggml_blck_size(src1->type);
             s11 *= src1_bs;
             s12 *= src1_bs;
@@ -2115,6 +2128,10 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    if (ggml_cuda_mmdq_rdna4_supported(src0, src1, dst)) {
+        ggml_cuda_mmdq_rdna4(ctx, src0, src1, dst);
         return;
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
@@ -4960,6 +4977,7 @@ static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml
     if(weight->ne[2]!=(experts ? 256 : 1) || weight->ne[3]!=1 || weight->ne[0]!=gate->ne[0] ||
             !(weight->type==GGML_TYPE_Q4_K || weight->type==GGML_TYPE_Q5_K || weight->type==GGML_TYPE_Q6_K ||
               weight->type==GGML_TYPE_Q8_0 || weight->type==GGML_TYPE_IQ4_XS)) { return 0; }
+    if(!ggml_cuda_should_use_mmq(weight->type,ggml_cuda_info().devices[ctx.device].cc,experts ? gate->ne[2] : gate->ne[1],experts ? weight->ne[2] : 0)) { return 0; }
     for(const ggml_tensor * t:{gate,up,static_cast<const ggml_tensor *>(activation),static_cast<const ggml_tensor *>(out)}) {
         if(t->type!=GGML_TYPE_F32 || !ggml_is_contiguous(t) || !t->buffer || t->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
     }

@@ -753,6 +753,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUDA_CHECK(cudaFree(data));
         }
     }
+    for (void * data : mmdq_cache.data) {
+        if (data) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(data));
+        }
+    }
     for (void * data : fa_bounds_cache.data) {
         if (data) {
             ggml_cuda_set_device(device);
@@ -4433,7 +4439,7 @@ static int ggml_cuda_try_norm_gate(ggml_backend_cuda_context & ctx, ggml_cgraph 
 #endif
 
 #if defined(GGML_USE_HIP)
-// Prefill GDN output: rms_norm(x)*w * silu(z) -> reshape -> MMQ matmul. One kernel writes the MMQ q8_1 input directly,
+// Prefill GDN output: rms_norm(x)*w * silu(z) -> reshape -> matmul. One kernel writes the q8_1 or f16 input directly,
 // bit identical to the unfused norm, gated op and quantization. GGML_HIP_PREFILL_NORM_GATE=0 disables it.
 static int ggml_cuda_try_prefill_norm_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
     static const bool enabled = [] {
@@ -4480,13 +4486,36 @@ static int ggml_cuda_try_prefill_norm_gate(ggml_backend_cuda_context & ctx, ggml
             src1->ne[0] % MATRIX_ROW_PADDING != 0 || w->ne[0] != src1->ne[0] || w->ne[2] != 1 || w->ne[3] != 1 ||
             !ggml_is_contiguous(w) || !w->buffer || w->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device) ||
             mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(mm) || !ggml_is_contiguous(src1) ||
-            !ggml_is_quantized(w->type) || !quantize_mmq_norm_gate_supported(w->type) ||
-            !ggml_cuda_should_use_mmq(w->type, cc, src1->ne[1], 0)) { return 0; }
+            !ggml_is_quantized(w->type)) { return 0; }
+    const bool mmq = ggml_cuda_should_use_mmq(w->type, cc, src1->ne[1], 0);
+    if (mmq) {
+        if (!quantize_mmq_norm_gate_supported(w->type)) { return 0; }
+    } else {
+        static const bool f16_enabled = [] {
+            const char * value = getenv("GGML_HIP_PREFILL_NORM_F16");
+            const char * cache = getenv("GGML_HIP_MMDQ_F16_CACHE");
+            return (!value || std::atoi(value) != 0) && (!cache || std::atoi(cache) != 0);
+        }();
+        if (!f16_enabled || !ctx.mmvq_cache.enabled || !ctx.stream_context().concurrent_events.empty() ||
+                !ggml_cuda_mmdq_rdna4_supported(w, src1, mm) ||
+                ggml_nbytes(src1)/2 > ggml_hip_mmq_cache::max_size) { return 0; }
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &status));
+        if (status != hipStreamCaptureStatusNone) { return 0; }
+    }
     std::vector<int> selected;
     std::vector<ggml_op> operations;
     for (int j = i; j <= next; ++j) { selected.push_back(j); operations.push_back(graph->nodes[j]->op); }
     if (!ggml_can_fuse_subgraph_ext(graph, selected.data(), int(selected.size()), operations.data(), &next, 1)) { return 0; }
     if (gate_mm) {
+        // The gate projection cannot read an intermediate that this fusion omits.
+        for (const ggml_tensor * input : gate_mm->src) {
+            for (const ggml_tensor * source = input; source; source = source->view_src) {
+                for (int j = i; j < u && graph->nodes[j] != gate_mm; ++j) {
+                    if (!ggml_cuda_is_view_or_noop(graph->nodes[j]) && source == graph->nodes[j]) { return 0; }
+                }
+            }
+        }
         const auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
             const uintptr_t ap = reinterpret_cast<uintptr_t>(a->data), bp = reinterpret_cast<uintptr_t>(b->data);
             return ap < bp+ggml_nbytes(b) && bp < ap+ggml_nbytes(a);
@@ -4494,6 +4523,15 @@ static int ggml_cuda_try_prefill_norm_gate(ggml_backend_cuda_context & ctx, ggml
         // The gate projection runs first and must not overwrite the normalization input.
         if (overlaps(gate_mm, x) || overlaps(gate_mm, weight)) { return 0; }
         if (!ggml_cuda_compute_forward(ctx, gate_mm)) { return 0; }
+    }
+    if (!mmq) {
+        const int slot = (ctx.mmdq_cache.last + 1) % ggml_hip_mmq_cache::nslots;
+        half * f16 = (half *) ctx.mmdq_cache.reserve(slot, src1, 0, ggml_nbytes(src1)/2, ctx.stream());
+        GGML_ASSERT(f16);
+        ggml_cuda_norm_gate_f16((const float *) x->data, (const float *) weight->data, (const float *) gate->data,
+            ggml_get_op_params_f32(norm, 0), f16, int(x->ne[1]), int(x->ne[2]), ctx.stream());
+        // The graph loop commits the slot after invalidating the skipped F32 writes.
+        return u + 1 - i;
     }
     ggml_cuda_pool_alloc<char> quantized(ctx.pool(), ggml_cuda_mul_mat_q_src1_nbytes(w, src1));
     quantize_mmq_norm_gate_cuda(static_cast<const float *>(x->data), static_cast<const float *>(weight->data),
@@ -6237,11 +6275,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     for (int j = i; j <= i + nodes_to_skip; ++j) {
                         cuda_ctx->mmvq_cache.invalidate_write(cgraph->nodes[j]);
                         cuda_ctx->mmq_cache.invalidate_write(cgraph->nodes[j]);
+                        cuda_ctx->mmdq_cache.invalidate_write(cgraph->nodes[j]);
                         cuda_ctx->mmq_ids_cache.invalidate_write(cgraph->nodes[j]);
                         cuda_ctx->fa_bounds_cache.invalidate_write(cgraph->nodes[j]);
                     }
                     cuda_ctx->mmvq_cache.commit();
                     cuda_ctx->mmq_cache.commit();
+                    cuda_ctx->mmdq_cache.commit();
 #endif
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
@@ -6279,6 +6319,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 if (node->op == GGML_OP_MUL_MAT && ggml_cuda_mul_mat_f32_pair(*cuda_ctx, cgraph, i)) {
                     cuda_ctx->mmvq_cache.invalidate_write(node);
                     cuda_ctx->mmq_cache.invalidate_write(node);
+                    cuda_ctx->mmdq_cache.invalidate_write(node);
                     cuda_ctx->mmq_ids_cache.invalidate_write(node);
                     cuda_ctx->fa_bounds_cache.invalidate_write(node);
                     continue;
@@ -6292,6 +6333,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 #if defined(GGML_USE_HIP)
                 cuda_ctx->mmvq_cache.invalidate_write(node);
                 cuda_ctx->mmq_cache.invalidate_write(node);
+                cuda_ctx->mmdq_cache.invalidate_write(node);
                 cuda_ctx->mmq_ids_cache.invalidate_write(node);
                 cuda_ctx->fa_bounds_cache.invalidate_write(node);
 #endif
@@ -6370,6 +6412,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     auto & cache = cuda_ctx->mmvq_cache;
     cache.reset();
     cuda_ctx->mmq_cache.reset();
+    cuda_ctx->mmdq_cache.reset();
     cuda_ctx->mmq_ids_cache.reset();
     cuda_ctx->fa_bounds_cache.reset();
     cuda_ctx->f32_pair.partner = nullptr;

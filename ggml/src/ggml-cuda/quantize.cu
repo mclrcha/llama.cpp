@@ -1,4 +1,5 @@
 #include "quantize.cuh"
+#include "convert.cuh"
 #include "unary.cuh"
 #include <cstdint>
 
@@ -704,10 +705,10 @@ void quantize_mmq_fp4_cuda(
 }
 
 #if defined(GGML_USE_HIP)
-// Prefill GDN output: rms_norm(x)*w * silu(g) for rows of 128 values, written as MMQ q8_1 blocks.
+// Prefill GDN output: rms_norm(x)*w * silu(g) for rows of 128 values, written as MMQ q8_1 blocks or MMDQ f16.
 // One warp per (token, head), 4 values per lane. The sum of squares follows rms_norm_f32<256> for 128 columns and the
 // quantization follows quantize_mmq_q8_1, so the result is bit identical to the unfused path.
-template <mmq_q8_1_ds_layout ds_layout>
+template <mmq_q8_1_ds_layout ds_layout, bool f16 = false>
 static __global__ void quantize_mmq_norm_gate_128(const float * __restrict__ x, const float * __restrict__ w,
         const float * __restrict__ g, void * __restrict__ vy, const float eps, const int nheads, const int ne1) {
     const int t    = blockIdx.x;
@@ -762,6 +763,21 @@ static __global__ void quantize_mmq_norm_gate_128(const float * __restrict__ x, 
         xi.w = sv.w * (scale * xv.w * wv.w);
     }
 
+    if constexpr (f16) {
+        const float values[4] = {xi.x, xi.y, xi.z, xi.w};
+        half out[4];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            const float value = values[c];
+            // Match convert_f32_f16_sat, including NaNs and overflow saturation.
+            out[c] = ggml_cuda_cast<half>(value > 65504.0f ? 65504.0f : (value < -65504.0f ? -65504.0f : value));
+        }
+        half2 * y = (half2 *) vy + base/2;
+        y[0] = make_half2(out[0], out[1]);
+        y[1] = make_half2(out[2], out[3]);
+        return;
+    }
+
     float amax = fabsf(xi.x);
     amax = fmaxf(amax, fabsf(xi.y));
     amax = fmaxf(amax, fabsf(xi.z));
@@ -795,6 +811,15 @@ static __global__ void quantize_mmq_norm_gate_128(const float * __restrict__ x, 
             y->d4[lane/8] = d;
         }
     }
+}
+
+void ggml_cuda_norm_gate_f16(const float * x, const float * w, const float * g, float eps, half * dst,
+        int nheads, int n, cudaStream_t stream) {
+    constexpr int heads_per_block = 4;
+    const dim3 grid(n, (nheads + heads_per_block - 1)/heads_per_block);
+    const dim3 block(WARP_SIZE, heads_per_block);
+    quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_D4, true><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 bool quantize_mmq_norm_gate_supported(ggml_type type) {

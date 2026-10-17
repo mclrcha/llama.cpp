@@ -70,6 +70,9 @@ void quantize_scatter_mmq_q8_1_cuda(const float *   x,
                                     cudaStream_t    stream);
 
 #if defined(GGML_USE_HIP)
+// Prefill GDN norm/gate directly in the saturated f16 layout consumed by mmdq.
+void ggml_cuda_norm_gate_f16(const float * x, const float * w, const float * g, float eps, half * dst,
+        int nheads, int n, cudaStream_t stream);
 bool quantize_mmq_norm_gate_supported(ggml_type type);
 void quantize_mmq_norm_gate_cuda(const float * x, const float * w, const float * g, float eps, void * dst, ggml_type type,
         int nheads, int n, cudaStream_t stream);

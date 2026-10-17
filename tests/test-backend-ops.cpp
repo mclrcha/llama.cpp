@@ -5738,27 +5738,28 @@ struct test_gdn_gates : public test_case {
 struct test_prefill_norm_gate : public test_case {
     const ggml_type type;
     const int64_t heads, tokens, m;
-    const bool external, gate_proj;
-    test_prefill_norm_gate(ggml_type type, int64_t heads, int64_t tokens, int64_t m, bool external = false, bool gate_proj = false)
-        : type(type), heads(heads), tokens(tokens), m(m), external(external), gate_proj(gate_proj) {}
+    const bool external, gate_proj, gate_dep;
+    test_prefill_norm_gate(ggml_type type, int64_t heads, int64_t tokens, int64_t m, bool external = false, bool gate_proj = false, bool gate_dep = false)
+        : type(type), heads(heads), tokens(tokens), m(m), external(external), gate_proj(gate_proj), gate_dep(gate_dep) {}
     bool run_whole_graph() override { return true; }
     std::string op_desc(ggml_tensor *) override { return "PREFILL_NORM_GATE"; }
-    std::string vars() override { return VARS_TO_STR6(type, heads, tokens, m, external, gate_proj); }
+    std::string vars() override { return VARS_TO_STR7(type, heads, tokens, m, external, gate_proj, gate_dep); }
     double max_nmse_err() override { return 5e-4; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, heads, tokens);
+        auto * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
+        auto * norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
         ggml_tensor * z;
         if (gate_proj) {
             // Gate projection between the norm and the SiLU in graph order, as in the dense model.
-            auto * inp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, tokens);
-            auto * wz  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 512, 128*heads);
+            auto * inp = gate_dep ? ggml_reshape_2d(ctx, norm, 128*heads, tokens) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 512, tokens);
+            auto * wz  = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, inp->ne[0], 128*heads);
             z = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wz, inp), 128, heads, tokens);
         } else {
             z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 128, heads, tokens);
         }
-        auto * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 128);
         auto * weight = ggml_new_tensor_2d(ctx, type, 128*heads, m);
-        auto * gated = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w), ggml_silu(ctx, z));
+        auto * gated = ggml_mul(ctx, norm, ggml_silu(ctx, z));
         auto * out = ggml_mul_mat(ctx, weight, ggml_reshape_2d(ctx, gated, 128*heads, tokens));
         if (external) {
             out = ggml_concat(ctx, out, ggml_reshape_2d(ctx, gated, 128*heads, tokens), 0);
@@ -11128,6 +11129,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_prefill_norm_gate(type, 48, 64, 128, true));
         test_cases.emplace_back(new test_prefill_norm_gate(type, 48, 300, 200, false, true));
     }
+    // MMDQ threshold: each K-quant, external gated output, and an intervening gate projection.
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        test_cases.emplace_back(new test_prefill_norm_gate(type, 4, 1024, 32));
+    }
+    test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 4, 1024, 32, true));
+    test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 4, 1024, 32, false, true));
+    test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 4, 1024, 32, false, true, true));
+    test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 4, 128, 32, false, true, true));
     test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 48, 2048, 256));
     test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 48, 16, 256));
 

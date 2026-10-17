@@ -1829,6 +1829,8 @@ struct ggml_backend_cuda_context {
 #if defined(GGML_USE_HIP)
     ggml_hip_mmvq_cache mmvq_cache;
     ggml_hip_mmq_cache  mmq_cache;
+    // Separate slots reuse the saturating f16 conversion of dense prefill inputs.
+    ggml_hip_mmq_cache  mmdq_cache;
     ggml_hip_mmq_ids_cache mmq_ids_cache;
     ggml_hip_fa_bounds_cache fa_bounds_cache;
     ggml_hip_input_gather  input_gather;

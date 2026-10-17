@@ -61,20 +61,26 @@ static __device__ __forceinline__ void mmdq_load_words(int * dst, const uint8_t 
     }
 }
 
-// Raw data of values [32 s + VPT p, 32 s + VPT p + VPT) of the super-block at blk.
-template <ggml_type type, int VPT>
+// REUSE retains bytes shared by consecutive sub-blocks; calls must start at s=0 and proceed in order.
+template <ggml_type type, int VPT, bool REUSE>
 static __device__ __forceinline__ void mmdq_load(mmdq_raw<type, VPT> & r, const char * blk, const int s, const int p) {
     if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
         typedef std::conditional_t<type == GGML_TYPE_Q4_K, block_q4_K, block_q5_K> block_t;
         const block_t * b = (const block_t *) blk;
-        mmdq_load_words<VPT/4>(r.qs, b->qs + 32*(s >> 1) + VPT*p);
-        if constexpr (type == GGML_TYPE_Q5_K) {
-            mmdq_load_words<VPT/4>(r.qh, b->qh + VPT*p);
+        if (!REUSE || (s & 1) == 0) {
+            mmdq_load_words<VPT/4>(r.qs, b->qs + 32*(s >> 1) + VPT*p);
         }
-        r.dm = *(const uint32_t *) &b->dm;
+        if constexpr (type == GGML_TYPE_Q5_K) {
+            if (!REUSE || s == 0) {
+                mmdq_load_words<VPT/4>(r.qh, b->qh + VPT*p);
+            }
+        }
+        if (!REUSE || s == 0) {
+            r.dm = *(const uint32_t *) &b->dm;
 #pragma unroll
-        for (int i = 0; i < 3; ++i) {
-            r.sc[i] = ((const uint32_t *) b->scales)[i];
+            for (int i = 0; i < 3; ++i) {
+                r.sc[i] = ((const uint32_t *) b->scales)[i];
+            }
         }
     } else {
         static_assert(type == GGML_TYPE_Q6_K, "bad type");
@@ -148,7 +154,7 @@ static __device__ __forceinline__ void mmdq_store(half * dst, const half2 * y) {
 #endif // MMDQ_RDNA4_AVAILABLE
 
 // dst[n, m] = sum_k W[m, k] X[n, k]; W: M rows of K quantized values (nbw bytes per row), X: f16 [N, K], dst row stride ldy.
-template <ggml_type type, int WM, int WN>
+template <ggml_type type, int WM, int WN, bool REUSE>
 __launch_bounds__(WM*WN*WARP_SIZE, 1)
 static __global__ void mmdq_rdna4(
         const char * __restrict__ W, const half * __restrict__ X, float * __restrict__ dst,
@@ -218,7 +224,7 @@ static __global__ void mmdq_rdna4(
     const auto step = [&](const int t, const half8 (&bc)[4][2], half8 (&bn)[4][2]) {
         const bool more = t + 1 < nsteps;
         if (more) {
-            mmdq_load<type, VPT>(raw, wrow + int64_t((t + 1) >> 3)*mmdq_block_bytes<type>(), (t + 1) & 7, ap);
+            mmdq_load<type, VPT, REUSE>(raw, wrow + int64_t((t + 1) >> 3)*mmdq_block_bytes<type>(), (t + 1) & 7, ap);
             load_b(bn, t + 1);
         }
 
@@ -247,7 +253,7 @@ static __global__ void mmdq_rdna4(
         mmdq_lds_barrier();
     };
 
-    mmdq_load<type, VPT>(raw, wrow, 0, ap);
+    mmdq_load<type, VPT, REUSE>(raw, wrow, 0, ap);
     load_b(b0, 0);
     {
         half2 y[VPT/2];
@@ -312,7 +318,12 @@ static void mmdq_rdna4_launch(const char * W, const half * X, float * dst, const
         const int64_t nbw, const int64_t ldy, cudaStream_t stream) {
     const dim3 grid((M + 64*WM - 1)/(64*WM), (N + 64*WN - 1)/(64*WN));
     const dim3 block(WARP_SIZE, WM*WN);
-    mmdq_rdna4<type, WM, WN><<<grid, block, 0, stream>>>(W, X, dst, M, N, K, nbw, ldy);
+    static const bool reuse = [] { const char * e = getenv("GGML_HIP_MMDQ_REUSE"); return !e || std::atoi(e) != 0; }();
+    if (reuse && type != GGML_TYPE_Q6_K) {
+        mmdq_rdna4<type, WM, WN, true><<<grid, block, 0, stream>>>(W, X, dst, M, N, K, nbw, ldy);
+    } else {
+        mmdq_rdna4<type, WM, WN, false><<<grid, block, 0, stream>>>(W, X, dst, M, N, K, nbw, ldy);
+    }
 }
 
 template <ggml_type type>
@@ -336,16 +347,37 @@ void ggml_cuda_mmdq_rdna4(ggml_backend_cuda_context & ctx, const ggml_tensor * s
     const int K = src0->ne[0];
     const int N = src1->ne[1];
 
-    ggml_cuda_pool_alloc<half> x16(ctx.pool(), int64_t(N)*K);
-    ggml_cuda_convert_f32_f16_sat((const float *) src1->data, x16.get(), int64_t(N)*K, stream);
+    ggml_cuda_pool_alloc<half> x16_tmp(ctx.pool());
+    half * x16 = nullptr;
+    bool reuse = false;
+#if defined(GGML_USE_HIP)
+    static const bool cache_enabled = [] {
+        const char * value = getenv("GGML_HIP_MMDQ_F16_CACHE");
+        return !value || std::atoi(value) != 0;
+    }();
+    if (cache_enabled && ctx.mmvq_cache.enabled && ctx.curr_stream_no == 0) {
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+        // Captured graphs must not retain a slot that can be reallocated by a later graph.
+        if (status == hipStreamCaptureStatusNone) {
+            x16 = (half *) ctx.mmdq_cache.acquire(src1, 0, ggml_nbytes(src1)/2, stream, reuse);
+        }
+    }
+#endif
+    if (!x16) {
+        x16 = x16_tmp.alloc(int64_t(N)*K);
+    }
+    if (!reuse) {
+        ggml_cuda_convert_f32_f16_sat((const float *) src1->data, x16, int64_t(N)*K, stream);
+    }
 
     const char * W = (const char *) src0->data;
     float * y = (float *) dst->data;
     const int64_t ldy = dst->nb[1]/sizeof(float);
     switch (src0->type) {
-        case GGML_TYPE_Q4_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q4_K>(W, x16.get(), y, M, N, K, src0->nb[1], ldy, stream); break;
-        case GGML_TYPE_Q5_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q5_K>(W, x16.get(), y, M, N, K, src0->nb[1], ldy, stream); break;
-        case GGML_TYPE_Q6_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q6_K>(W, x16.get(), y, M, N, K, src0->nb[1], ldy, stream); break;
+        case GGML_TYPE_Q4_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q4_K>(W, x16, y, M, N, K, src0->nb[1], ldy, stream); break;
+        case GGML_TYPE_Q5_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q5_K>(W, x16, y, M, N, K, src0->nb[1], ldy, stream); break;
+        case GGML_TYPE_Q6_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q6_K>(W, x16, y, M, N, K, src0->nb[1], ldy, stream); break;
         default: GGML_ABORT("unsupported type");
     }
     CUDA_CHECK(cudaGetLastError());

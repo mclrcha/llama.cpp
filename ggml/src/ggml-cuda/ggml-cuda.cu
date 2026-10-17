@@ -2138,7 +2138,16 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+    bool use_mmq = ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
+#if defined(GGML_USE_HIP) && !defined(GGML_CUDA_FORCE_CUBLAS)
+    if (!use_mmq && src0->type == GGML_TYPE_IQ4_XS && GGML_CUDA_CC_IS_RDNA4(cc)) {
+        static const bool mmdq_enabled = [] { const char * e = getenv("GGML_HIP_MMDQ"); return !e || std::atoi(e) != 0; }();
+        // Keep the existing MMQ path for IQ4 shapes that the deterministic F16 kernel cannot handle.
+        use_mmq = mmdq_enabled && ggml_cuda_info().devices[ctx.device].smpbo >= 48*1024 &&
+            !ggml_cuda_mmdq_rdna4_supported(src0, src1, dst);
+    }
+#endif
+    if (use_mmq) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -4498,7 +4507,7 @@ static int ggml_cuda_try_prefill_norm_gate(ggml_backend_cuda_context & ctx, ggml
         }();
         if (!f16_enabled || !ctx.mmvq_cache.enabled || !ctx.stream_context().concurrent_events.empty() ||
                 !ggml_cuda_mmdq_rdna4_supported(w, src1, mm) ||
-                ggml_nbytes(src1)/2 > ggml_hip_mmq_cache::max_size) { return 0; }
+                ggml_nbytes(src1)/2 > ctx.mmdq_cache.max_size) { return 0; }
         hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
         CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &status));
         if (status != hipStreamCaptureStatusNone) { return 0; }
@@ -5001,6 +5010,10 @@ static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml
         auto * mul=graph->nodes[i+1];
         if(mul->op!=GGML_OP_MUL || mul->src[0]!=first) { return 0; }
         gate=first->src[0];up=mul->src[1];++last;
+        // The fusion does not materialize the SiLU output.
+        for (const ggml_tensor * source = up; source; source = source->view_src) {
+            if (source == first) { return 0; }
+        }
     } else { return 0; }
     auto * activation=graph->nodes[last];
     if(last+1>=graph->n_nodes) { return 0; }
@@ -5021,11 +5034,25 @@ static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml
     if(weight->ne[2]!=(experts ? 256 : 1) || weight->ne[3]!=1 || weight->ne[0]!=gate->ne[0] ||
             !(weight->type==GGML_TYPE_Q4_K || weight->type==GGML_TYPE_Q5_K || weight->type==GGML_TYPE_Q6_K ||
               weight->type==GGML_TYPE_Q8_0 || weight->type==GGML_TYPE_IQ4_XS)) { return 0; }
-    if(!ggml_cuda_should_use_mmq(weight->type,ggml_cuda_info().devices[ctx.device].cc,experts ? gate->ne[2] : gate->ne[1],experts ? weight->ne[2] : 0)) { return 0; }
+    const bool mmq = ggml_cuda_should_use_mmq(weight->type, ggml_cuda_info().devices[ctx.device].cc,
+        experts ? gate->ne[2] : gate->ne[1], experts ? weight->ne[2] : 0);
     for(const ggml_tensor * t:{gate,up,static_cast<const ggml_tensor *>(activation),static_cast<const ggml_tensor *>(out)}) {
         if(t->type!=GGML_TYPE_F32 || !ggml_is_contiguous(t) || !t->buffer || t->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
     }
     if(!ggml_is_contiguous(weight) || !weight->buffer || weight->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
+    if (!mmq) {
+        static const bool f16_enabled = [] {
+            const char * value = getenv("GGML_HIP_PREFILL_SILU_F16");
+            const char * cache = getenv("GGML_HIP_MMDQ_F16_CACHE");
+            return (!value || std::atoi(value) != 0) && (!cache || std::atoi(cache) != 0);
+        }();
+        if (!f16_enabled || experts || !ctx.stream_context().concurrent_events.empty() ||
+                !ggml_cuda_mmdq_rdna4_supported(weight, activation, out) ||
+                ggml_nbytes(activation)/2 > ctx.mmdq_cache.max_size) { return 0; }
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &status));
+        if (status != hipStreamCaptureStatusNone) { return 0; }
+    }
     ggml_op ops[3];for(int j=i;j<=last+1;++j) { ops[j-i]=graph->nodes[j]->op; }
     const int output=last+1;
     if(!ggml_can_fuse_subgraph(graph,i,output-i+1,ops,&output,1) ||
@@ -5037,6 +5064,17 @@ static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml
     // Quantized activations are complete before the expert matmul writes its output.
     if(overlaps(out,weight) || (!experts && (overlaps(out,gate) || overlaps(out,up)))) { return 0; }
     if(experts && overlaps(out,out->src[2])) { return 0; }
+    if (!mmq) {
+        const int slot = (ctx.mmdq_cache.last + 1) % ggml_hip_mmq_cache::nslots;
+        half * f16 = (half *) ctx.mmdq_cache.reserve(slot, activation, 0, ggml_nbytes(activation)/2, ctx.stream());
+        GGML_ASSERT(f16);
+        ggml_cuda_silu_f16((const float *) gate->data, (const float *) up->data, f16, ggml_nelements(activation), ctx.stream());
+        // The sole consumer runs now. The graph loop then invalidates the omitted F32 activation.
+        ctx.mmdq_cache.invalidate_write(activation);
+        ctx.mmdq_cache.commit();
+        ggml_cuda_mmdq_rdna4(ctx, weight, activation, out);
+        return output - i;
+    }
     ggml_cuda_mul_mat_q(ctx,weight,activation,experts ? out->src[2] : nullptr,out,gate,up);
     return output-i;
 }

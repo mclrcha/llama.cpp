@@ -5768,6 +5768,36 @@ struct test_prefill_norm_gate : public test_case {
     }
 };
 
+struct test_prefill_silu : public test_case {
+    const ggml_type type;
+    const int64_t k, tokens, m;
+    const bool separate, external, dependent;
+
+    test_prefill_silu(ggml_type type, int64_t k, int64_t tokens, int64_t m, bool separate = false, bool external = false, bool dependent = false)
+        : type(type), k(k), tokens(tokens), m(m), separate(separate), external(external), dependent(dependent) {}
+
+    bool run_whole_graph() override { return true; }
+    int eval_runs() override { return 4; }
+    std::string op_desc(ggml_tensor *) override { return "PREFILL_SILU"; }
+    std::string vars() override { return VARS_TO_STR7(type, k, tokens, m, separate, external, dependent); }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        auto * up = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, tokens);
+        auto * weight = ggml_new_tensor_2d(ctx, type, k, m);
+        ggml_tensor * activation;
+        if (separate) {
+            auto * silu = ggml_silu(ctx, gate);
+            activation = ggml_mul(ctx, silu, dependent ? silu : up);
+        } else {
+            activation = ggml_swiglu_split(ctx, gate, up);
+        }
+        auto * out = ggml_mul_mat(ctx, weight, activation);
+        return external ? ggml_concat(ctx, out, activation, 0) : out;
+    }
+};
+
 struct test_mul_mat_reuse : public test_case {
     const ggml_type type;
     const int64_t n;
@@ -11129,8 +11159,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_prefill_norm_gate(type, 48, 64, 128, true));
         test_cases.emplace_back(new test_prefill_norm_gate(type, 48, 300, 200, false, true));
     }
-    // MMDQ threshold: each K-quant, external gated output, and an intervening gate projection.
-    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+    // MMDQ threshold: each weight type, external gated output, and an intervening gate projection.
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
         test_cases.emplace_back(new test_prefill_norm_gate(type, 4, 1024, 32));
     }
     test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 4, 1024, 32, true));
@@ -11139,6 +11169,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 4, 128, 32, false, true, true));
     test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 48, 2048, 256));
     test_cases.emplace_back(new test_prefill_norm_gate(GGML_TYPE_Q5_K, 48, 16, 256));
+
+    // SwiGLU into MMQ or MMDQ, including an external consumer that requires the F32 activation.
+    for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
+        for (bool separate : {false, true}) {
+            test_cases.emplace_back(new test_prefill_silu(type, 512, 1024, 48, separate));
+        }
+    }
+    test_cases.emplace_back(new test_prefill_silu(GGML_TYPE_Q5_K, 512, 1025, 48, false, true));
+    test_cases.emplace_back(new test_prefill_silu(GGML_TYPE_Q5_K, 512, 1025, 48, true, true));
+    test_cases.emplace_back(new test_prefill_silu(GGML_TYPE_Q5_K, 512, 128, 33, true));
+    test_cases.emplace_back(new test_prefill_silu(GGML_TYPE_Q5_K, 512, 128, 48, true, false, true));
+    test_cases.emplace_back(new test_prefill_silu(GGML_TYPE_Q5_K, 512, 1024, 48, true, false, true));
+    // 68 MiB F16 activation, then a shape above the 80 MiB MMDQ cache limit.
+    test_cases.emplace_back(new test_prefill_silu(GGML_TYPE_Q5_K, 17408, 2048, 16));
+    test_cases.emplace_back(new test_prefill_silu(GGML_TYPE_Q5_K, 21504, 2048, 16));
 
     // Dense prefill MMQ: partial row/column tiles, several K tiles, stream-k and non stream-k tile counts.
     for (ggml_type type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, GGML_TYPE_Q8_0}) {
@@ -11259,14 +11304,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 32, 509, 2112, {1, 1}, {1, 1}));
 
-    // dense K-quant prefill batches (f16 dequantization path on RDNA4): partial row and token tiles, several super-blocks
-    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+    // Dense quantized prefill batches: partial row and token tiles, several super-blocks.
+    for (ggml_type type_a : {GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_IQ4_XS}) {
         for (int64_t n : {512, 1031, 1600}) {
             test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1040, n, 1024, {1, 1}, {1, 1}));
         }
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 1000, 1031, 1024, {1, 1}, {1, 1}));
         test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 4096, 2048, 512, {1, 1}, {1, 1}));
     }
+
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 64, 1024, 256, {3, 2}, {2, 1}));
 
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {

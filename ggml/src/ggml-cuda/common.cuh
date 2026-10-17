@@ -1576,12 +1576,14 @@ struct ggml_hip_mmvq_cache {
 // projections (q/k/v, GDN qkv/z/alpha/beta, FFN gate/up) is quantized once per layout. Writes are tracked like above.
 struct ggml_hip_mmq_cache {
     static constexpr int    nslots   = 2;
-    static constexpr size_t max_size = size_t(64) << 20; // per slot
+    const size_t max_size; // per slot
     void *              data  [nslots] = {nullptr};
     size_t              size  [nslots] = {0};
     const ggml_tensor * src   [nslots] = {nullptr};
     int                 layout[nslots] = {0};
     int last = 0;
+
+    explicit ggml_hip_mmq_cache(size_t max_size = size_t(64) << 20) : max_size(max_size) {}
 
     // Returns nullptr if the input is too large or the slot cannot grow (stream capture).
     char * acquire(const ggml_tensor * source, const int ds_layout, const size_t nbytes, cudaStream_t stream, bool & reuse) {
@@ -1830,7 +1832,7 @@ struct ggml_backend_cuda_context {
     ggml_hip_mmvq_cache mmvq_cache;
     ggml_hip_mmq_cache  mmq_cache;
     // Separate slots reuse the saturating f16 conversion of dense prefill inputs.
-    ggml_hip_mmq_cache  mmdq_cache;
+    ggml_hip_mmq_cache  mmdq_cache{size_t(80) << 20};
     ggml_hip_mmq_ids_cache mmq_ids_cache;
     ggml_hip_fa_bounds_cache fa_bounds_cache;
     ggml_hip_input_gather  input_gather;

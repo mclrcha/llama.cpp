@@ -844,6 +844,19 @@ void quantize_mmq_norm_gate_cuda(const float * x, const float * w, const float *
     }
 }
 
+static __global__ void silu_f16(const float * gate, const float * up, half * dst, const int64_t n) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i < n) {
+        const float value = ggml_cuda_op_silu_single(gate[i])*up[i];
+        dst[i] = ggml_cuda_cast<half>(value > 65504.0f ? 65504.0f : (value < -65504.0f ? -65504.0f : value));
+    }
+}
+
+void ggml_cuda_silu_f16(const float * gate, const float * up, half * dst, int64_t n, cudaStream_t stream) {
+    const int block = 256;
+    silu_f16<<<(n + block - 1)/block, block, 0, stream>>>(gate, up, dst, n);
+}
+
 // silu(gate)*up quantized to the MMQ Q8_1 layout. Each thread handles nchunk groups of 4 values that are 512 apart and
 // issues all their loads first: same values and shuffle groups as quantize_mmq_q8_1<..., silu>, more bytes in flight.
 template <mmq_q8_1_ds_layout ds_layout, int nchunk>

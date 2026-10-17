@@ -1,11 +1,12 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "mmdq-rdna4.cuh"
+#include "vecdotq.cuh"
 
 #include <cstdlib>
 #include <type_traits>
 
-// Dense matrix multiplication on RDNA4 for K-quant weights and large batches (prefill).
+// Dense matrix multiplication on RDNA4 for K-quant / IQ4_XS weights and large batches (prefill).
 //
 // The weights are dequantized to f16 with the expressions of ggml_get_to_fp16_cuda and the activations are converted to
 // f16 (saturating), then WMMA multiplies them with f32 accumulation: the precision of the dequantize + hipBLAS path without
@@ -35,11 +36,13 @@ template <int VPT> struct mmdq_raw<GGML_TYPE_Q4_K, VPT> { int qs[VPT/4]; uint32_
 template <int VPT> struct mmdq_raw<GGML_TYPE_Q5_K, VPT> { int qs[VPT/4]; int qh[VPT/4]; uint32_t dm; uint32_t sc[3]; };
 // Blocks of 210 bytes: the vector loads are only 2 byte aligned (unaligned global loads are supported on RDNA4).
 template <int VPT> struct mmdq_raw<GGML_TYPE_Q6_K, VPT> { int ql[VPT/4]; int qh[VPT/4]; int sc; half d; };
+template <int VPT> struct mmdq_raw<GGML_TYPE_IQ4_XS, VPT> { int qs[VPT/4]; uint32_t ds; uint32_t sc; int shift; };
 
 template <ggml_type type> constexpr int mmdq_block_bytes();
 template <> constexpr int mmdq_block_bytes<GGML_TYPE_Q4_K>() { return sizeof(block_q4_K); }
 template <> constexpr int mmdq_block_bytes<GGML_TYPE_Q5_K>() { return sizeof(block_q5_K); }
 template <> constexpr int mmdq_block_bytes<GGML_TYPE_Q6_K>() { return sizeof(block_q6_K); }
+template <> constexpr int mmdq_block_bytes<GGML_TYPE_IQ4_XS>() { return sizeof(block_iq4_xs); }
 
 #ifdef MMDQ_RDNA4_AVAILABLE
 // Barrier for SRAM only: __syncthreads also invalidates the vector L0 cache (acquire at workgroup scope in WGP mode).
@@ -82,6 +85,14 @@ static __device__ __forceinline__ void mmdq_load(mmdq_raw<type, VPT> & r, const 
                 r.sc[i] = ((const uint32_t *) b->scales)[i];
             }
         }
+    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+        const block_iq4_xs * b = (const block_iq4_xs *) blk;
+        mmdq_load_words<VPT/4>(r.qs, b->qs + 16*s + (VPT*p % 16));
+        r.shift = 4*(VPT*p/16);
+        if (!REUSE || s == 0) {
+            r.ds = *(const uint32_t *) &b->d;
+            r.sc = *(const uint32_t *) b->scales_l;
+        }
     } else {
         static_assert(type == GGML_TYPE_Q6_K, "bad type");
         const block_q6_K * b = (const block_q6_K *) blk;
@@ -94,7 +105,7 @@ static __device__ __forceinline__ void mmdq_load(mmdq_raw<type, VPT> & r, const 
     }
 }
 
-// The VPT f16 values of mmdq_load, computed as dequantize_q4_K / q5_K / q6_K do.
+// The VPT f16 values of mmdq_load, computed with the same expressions as the dequantize kernels.
 template <ggml_type type, int VPT>
 static __device__ __forceinline__ void mmdq_dequant(const mmdq_raw<type, VPT> & r, const int s, half2 * y) {
     if constexpr (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K) {
@@ -121,6 +132,21 @@ static __device__ __forceinline__ void mmdq_dequant(const mmdq_raw<type, VPT> & 
 #pragma unroll
             for (int b = 0; b < 4; ++b) {
                 v[b] = d1 * ((q >> (8*b)) & 0xFF) - m1;
+            }
+            y[2*i + 0] = make_half2(ggml_cuda_cast<half>(v[0]), ggml_cuda_cast<half>(v[1]));
+            y[2*i + 1] = make_half2(ggml_cuda_cast<half>(v[2]), ggml_cuda_cast<half>(v[3]));
+        }
+    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
+        const int ls = ((r.sc >> (4*s)) & 0x0F) | (((r.ds >> (16 + 2*s)) & 3) << 4);
+        const half d0 = *(const half *) &r.ds;
+        const float d = float(d0) * (ls - 32);
+#pragma unroll
+        for (int i = 0; i < VPT/4; ++i) {
+            const int q = get_int_from_table_16(r.qs[i] >> r.shift, kvalues_iq4nl).x;
+            float v[4];
+#pragma unroll
+            for (int b = 0; b < 4; ++b) {
+                v[b] = d * (int8_t) ((q >> (8*b)) & 0xFF);
             }
             y[2*i + 0] = make_half2(ggml_cuda_cast<half>(v[0]), ggml_cuda_cast<half>(v[1]));
             y[2*i + 1] = make_half2(ggml_cuda_cast<half>(v[2]), ggml_cuda_cast<half>(v[3]));
@@ -154,7 +180,7 @@ static __device__ __forceinline__ void mmdq_store(half * dst, const half2 * y) {
 #endif // MMDQ_RDNA4_AVAILABLE
 
 // dst[n, m] = sum_k W[m, k] X[n, k]; W: M rows of K quantized values (nbw bytes per row), X: f16 [N, K], dst row stride ldy.
-template <ggml_type type, int WM, int WN, bool REUSE>
+template <ggml_type type, int WM, int WN, bool REUSE, bool EARLY_DEQUANT>
 __launch_bounds__(WM*WN*WARP_SIZE, 1)
 static __global__ void mmdq_rdna4(
         const char * __restrict__ W, const half * __restrict__ X, float * __restrict__ dst,
@@ -228,6 +254,14 @@ static __global__ void mmdq_rdna4(
             load_b(bn, t + 1);
         }
 
+        const auto store_next = [&] {
+            if (more) {
+                half2 y[VPT/2];
+                mmdq_dequant<type, VPT>(raw, (t + 1) & 7, y);
+                mmdq_store<VPT>(sa_st[(t + 1) & 1], y);
+            }
+        };
+
         const half * sa = sA[t & 1] + (64*wm + l16)*SA + 8*h;
 #pragma unroll
         for (int s2 = 0; s2 < 2; ++s2) {
@@ -243,12 +277,16 @@ static __global__ void mmdq_rdna4(
                     acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(af[i], bc[j][s2], acc[i][j]);
                 }
             }
+            if constexpr (EARLY_DEQUANT) {
+                if (s2 == 0) {
+                    // Leave one half of the current WMMA work after the next tile's dequantization and LDS stores.
+                    store_next();
+                }
+            }
         }
 
-        if (more) {
-            half2 y[VPT/2];
-            mmdq_dequant<type, VPT>(raw, (t + 1) & 7, y);
-            mmdq_store<VPT>(sa_st[(t + 1) & 1], y);
+        if constexpr (!EARLY_DEQUANT) {
+            store_next();
         }
         mmdq_lds_barrier();
     };
@@ -297,7 +335,7 @@ bool ggml_cuda_mmdq_rdna4_supported(const ggml_tensor * src0, const ggml_tensor 
     if (!enabled || !GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
         return false;
     }
-    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) {
+    if (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K && src0->type != GGML_TYPE_IQ4_XS) {
         return false;
     }
     return src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
@@ -319,17 +357,26 @@ static void mmdq_rdna4_launch(const char * W, const half * X, float * dst, const
     const dim3 grid((M + 64*WM - 1)/(64*WM), (N + 64*WN - 1)/(64*WN));
     const dim3 block(WARP_SIZE, WM*WN);
     static const bool reuse = [] { const char * e = getenv("GGML_HIP_MMDQ_REUSE"); return !e || std::atoi(e) != 0; }();
-    if (reuse && type != GGML_TYPE_Q6_K) {
-        mmdq_rdna4<type, WM, WN, true><<<grid, block, 0, stream>>>(W, X, dst, M, N, K, nbw, ldy);
-    } else {
-        mmdq_rdna4<type, WM, WN, false><<<grid, block, 0, stream>>>(W, X, dst, M, N, K, nbw, ldy);
+    if constexpr (type != GGML_TYPE_Q6_K) {
+        if (reuse) {
+            if constexpr (type == GGML_TYPE_Q4_K) {
+                static const bool early_dequant = [] { const char * e = getenv("GGML_HIP_MMDQ_EARLY_DEQUANT"); return !e || std::atoi(e) != 0; }();
+                if (early_dequant) {
+                    mmdq_rdna4<type, WM, WN, true, true><<<grid, block, 0, stream>>>(W, X, dst, M, N, K, nbw, ldy);
+                    return;
+                }
+            }
+            mmdq_rdna4<type, WM, WN, true, false><<<grid, block, 0, stream>>>(W, X, dst, M, N, K, nbw, ldy);
+            return;
+        }
     }
+    mmdq_rdna4<type, WM, WN, false, false><<<grid, block, 0, stream>>>(W, X, dst, M, N, K, nbw, ldy);
 }
 
 template <ggml_type type>
 static void mmdq_rdna4_switch_cfg(const char * W, const half * X, float * dst, const int M, const int N, const int K,
         const int64_t nbw, const int64_t ldy, cudaStream_t stream) {
-    // Tile of 64 WM x 64 WN: 2 x 4 for q4_K, 2 x 8 (half the dequantization per FLOP) for the costlier q5_K/q6_K unpacking.
+    // Tile of 64 WM x 64 WN: 2 x 4 for q4_K, 2 x 8 (half the dequantization per FLOP) for q5_K/q6_K/iq4_xs.
     // GGML_HIP_MMDQ_CFG 1: 2 x 4, 2: 2 x 8, 3: 4 x 4 for every type.
     static const int cfg_env = [] { const char * e = getenv("GGML_HIP_MMDQ_CFG"); return e ? std::atoi(e) : 0; }();
     const int cfg = cfg_env ? cfg_env : (type == GGML_TYPE_Q4_K ? 1 : 2);
@@ -378,6 +425,7 @@ void ggml_cuda_mmdq_rdna4(ggml_backend_cuda_context & ctx, const ggml_tensor * s
         case GGML_TYPE_Q4_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q4_K>(W, x16, y, M, N, K, src0->nb[1], ldy, stream); break;
         case GGML_TYPE_Q5_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q5_K>(W, x16, y, M, N, K, src0->nb[1], ldy, stream); break;
         case GGML_TYPE_Q6_K: mmdq_rdna4_switch_cfg<GGML_TYPE_Q6_K>(W, x16, y, M, N, K, src0->nb[1], ldy, stream); break;
+        case GGML_TYPE_IQ4_XS: mmdq_rdna4_switch_cfg<GGML_TYPE_IQ4_XS>(W, x16, y, M, N, K, src0->nb[1], ldy, stream); break;
         default: GGML_ABORT("unsupported type");
     }
     CUDA_CHECK(cudaGetLastError());

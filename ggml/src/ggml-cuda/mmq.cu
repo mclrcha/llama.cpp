@@ -607,14 +607,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
             }
         }
 
-        // Dense K-quant matrices with at least GGML_HIP_BLAS_MIN_BATCH (1024) columns are dequantized to f16 and multiplied with
+        // Dense K-quant / IQ4_XS matrices with at least GGML_HIP_BLAS_MIN_BATCH (1024) columns are dequantized to f16 and multiplied with
         // f32 accumulation (mmdq-rdna4.cu, or hipBLAS for shapes it does not cover): the per-sub-block scale epilogue keeps
         // their MMQ well below the f16 WMMA rate, and f16 activations are more precise than q8_1.
         // GGML_HIP_BLAS_TYPES overrides the type list (comma separated, "none" = always MMQ).
         static const std::array<bool, GGML_TYPE_COUNT> blas_types = [] {
             std::array<bool, GGML_TYPE_COUNT> sel{};
             const char * e = getenv("GGML_HIP_BLAS_TYPES");
-            const std::string s = e ? e : "q4_K,q5_K,q6_K";
+            const std::string s = e ? e : "q4_K,q5_K,q6_K,iq4_xs";
             for (size_t p = 0; p < s.size();) {
                 size_t q = s.find(',', p);
                 q = q == std::string::npos ? s.size() : q;
@@ -626,6 +626,10 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
                     }
                 }
                 p = q + 1;
+            }
+            const char * iq4_xs = getenv("GGML_HIP_MMDQ_IQ4_XS");
+            if (iq4_xs && std::atoi(iq4_xs) == 0) {
+                sel[GGML_TYPE_IQ4_XS] = false;
             }
             return sel;
         }();

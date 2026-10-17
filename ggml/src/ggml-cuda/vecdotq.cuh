@@ -4,6 +4,19 @@
 
 #include <cstdint>
 
+// Exact product of a small dot product and a block scale (both within 24 bits): on AMD v_mul_i32_i24 instead of the
+// quarter-rate v_mul_lo_u32 (GGML_HIP_MMVQ_MUL24 compile switch kept for A/B).
+#ifndef GGML_HIP_MMVQ_MUL24
+#define GGML_HIP_MMVQ_MUL24 1
+#endif
+static __device__ __forceinline__ int ggml_cuda_mul_small(const int a, const int b) {
+#if defined(GGML_USE_HIP) && GGML_HIP_MMVQ_MUL24
+    return __mul24(a, b);
+#else
+    return a*b;
+#endif
+}
+
 static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
     const uint8_t * x8 = (const uint8_t *) x;
 
@@ -483,7 +496,7 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmvq(
 
         const int vi = __vsub4(vil, vih);
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
     }
 
     return d3 * sumf;
@@ -530,13 +543,13 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1_impl_vmmq(
 
         const int dot1 = ggml_cuda_dp4a(v1i, u[2*i+1], ggml_cuda_dp4a(v0i, u[2*i+0], 0)); // SIMD dot product
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_d += d8[i] * ggml_cuda_mul_small(dot1, sc[i]);
         if constexpr (saved_sum) {
             // Four lanes share the stored sum of each Q8_1 block.
             sumf_m += s8[i] * (0.25f * m[i]);
         } else {
             const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+1], ggml_cuda_dp4a(0x01010101, u[2*i+0], 0)); // sum of u
-            sumf_m += d8[i] * (dot2 * m[i]);  // multiply constant part of q4_K with sum of q8_1 values
+            sumf_m += d8[i] * ggml_cuda_mul_small(dot2, m[i]);  // multiply constant part of q4_K with sum of q8_1 values
         }
     }
 
@@ -598,13 +611,13 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_vmmq(
 
         const int dot1 = ggml_cuda_dp4a(v0i, u[2*i+0], ggml_cuda_dp4a(v1i, u[2*i+1], 0)); // SIMD dot product
 
-        sumf_d += d8[i] * (dot1 * sc[i]);
+        sumf_d += d8[i] * ggml_cuda_mul_small(dot1, sc[i]);
         if constexpr (saved_sum) {
             // Four lanes share the stored sum of each Q8_1 block.
             sumf_m += s8[i] * (0.25f * m[i]);
         } else {
             const int dot2 = ggml_cuda_dp4a(0x01010101, u[2*i+0], ggml_cuda_dp4a(0x01010101, u[2*i+1], 0)); // sum of u
-            sumf_m += d8[i] * (dot2 * m[i]);
+            sumf_m += d8[i] * ggml_cuda_mul_small(dot2, m[i]);
         }
 
     }
@@ -662,7 +675,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1_impl_mmvq(
 
         const int vi = __vsub4((vil | vih), 0x20202020); // vi = (vil | vih) - 32
 
-        sumf += d8[i] * (ggml_cuda_dp4a(vi, u[i], 0) * sc); // SIMD dot product
+        sumf += d8[i] * ggml_cuda_mul_small(ggml_cuda_dp4a(vi, u[i], 0), sc); // SIMD dot product
     }
 
     return d*sumf;

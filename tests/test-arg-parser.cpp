@@ -14,7 +14,74 @@
 #undef NDEBUG
 #include <cassert>
 
+static void test_mtp_cache_types() {
+    const char * value = getenv("LLAMA_MTP_DRAFT_KV_INHERIT");
+    const bool inherit = !value || atoi(value) != 0;
+    auto parse = [](std::vector<std::string> args) {
+        common_params params;
+        std::vector<char *> argv;
+        for (auto & arg : args) {
+            argv.push_back(&arg[0]);
+        }
+        assert(common_params_parse(argv.size(), argv.data(), params, LLAMA_EXAMPLE_SERVER));
+        return params;
+    };
+    auto check = [](const common_params & params, ggml_type k, ggml_type v) {
+        const auto draft = common_base_params_to_speculative(params);
+        assert(draft.cache_type_k == k);
+        assert(draft.cache_type_v == v);
+        assert(params.cache_type_k == GGML_TYPE_Q8_0);
+        assert(params.cache_type_v == GGML_TYPE_Q8_0);
+    };
+
+    const std::vector<std::string> args = {"test", "--spec-type", "draft-mtp", "-ctk", "q8_0", "-ctv", "q8_0"};
+    auto params = parse(args);
+    assert(!params.speculative.draft.cache_type_k_set);
+    assert(!params.speculative.draft.cache_type_v_set);
+    check(params, inherit ? GGML_TYPE_Q8_0 : GGML_TYPE_F16, inherit ? GGML_TYPE_Q8_0 : GGML_TYPE_F16);
+
+    params.speculative.types = {COMMON_SPECULATIVE_TYPE_NONE};
+    check(params, GGML_TYPE_F16, GGML_TYPE_F16);
+    params.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP};
+    params.speculative.draft.mparams.path = "draft.gguf";
+    check(params, GGML_TYPE_F16, GGML_TYPE_F16);
+
+    for (const bool key : {false, true}) {
+        auto explicit_args = args;
+        explicit_args.insert(explicit_args.end(), {key ? "-ctkd" : "-ctvd", "f16"});
+        params = parse(explicit_args);
+        assert(params.speculative.draft.cache_type_k_set == key);
+        assert(params.speculative.draft.cache_type_v_set == !key);
+        check(params, key || !inherit ? GGML_TYPE_F16 : GGML_TYPE_Q8_0,
+                      !key || !inherit ? GGML_TYPE_F16 : GGML_TYPE_Q8_0);
+    }
+
+    auto explicit_args = args;
+    explicit_args.insert(explicit_args.end(), {"-ctkd", "q8_0", "-ctvd", "q8_0"});
+    check(parse(explicit_args), GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+
+    params = parse(args);
+    params.cache_type_k = GGML_TYPE_F16;
+    params.cache_type_v = GGML_TYPE_F16;
+    const auto draft = common_base_params_to_speculative(params);
+    assert(draft.cache_type_k == GGML_TYPE_F16);
+    assert(draft.cache_type_v == GGML_TYPE_F16);
+
+#ifndef _WIN32
+    setenv("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K", "f16", true);
+    setenv("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V", "q8_0", true);
+    params = parse(args);
+    assert(params.speculative.draft.cache_type_k_set);
+    assert(params.speculative.draft.cache_type_v_set);
+    check(params, GGML_TYPE_F16, GGML_TYPE_Q8_0);
+    check(parse(explicit_args), GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K");
+    unsetenv("LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V");
+#endif
+}
+
 static void test(void) {
+    test_mtp_cache_types();
     common_params params;
 
     auto assert_output_limits = [](int32_t n_batch, int32_t n_parallel, int32_t n_draft,

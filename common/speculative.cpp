@@ -2642,8 +2642,15 @@ common_params common_base_params_to_speculative(const common_params & params) {
         }
     }
 
-    result.cache_type_k  = params_spec.cache_type_k;
-    result.cache_type_v  = params_spec.cache_type_v;
+    // MTP shares the target model; inherit its KV types unless the draft types were explicitly set.
+    static const bool mtp_kv_inherit = [] {
+        const char * e = getenv("LLAMA_MTP_DRAFT_KV_INHERIT");
+        return !e || atoi(e) != 0;
+    }();
+    const auto & types = params.speculative.types;
+    const bool mtp = !has_draft && std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != types.end();
+    result.cache_type_k  = mtp && mtp_kv_inherit && !params_spec.cache_type_k_set ? params.cache_type_k : params_spec.cache_type_k;
+    result.cache_type_v  = mtp && mtp_kv_inherit && !params_spec.cache_type_v_set ? params.cache_type_v : params_spec.cache_type_v;
     result.n_outputs_max = params.n_parallel;
     result.n_outputs_max_per_seq = 1;
 

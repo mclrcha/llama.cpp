@@ -753,6 +753,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUDA_CHECK(cudaFree(data));
         }
     }
+    for (void * data : fa_bounds_cache.data) {
+        if (data) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaFree(data));
+        }
+    }
     if (input_gather.host) {
         ggml_cuda_set_device(device);
         for (int i = 0; i < ggml_hip_input_gather::n_slots; ++i) {
@@ -5208,7 +5214,15 @@ static int ggml_cuda_try_cont_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml
     int64_t K = 0, nrows_K = 0;
     void * q8 = ggml_cuda_glu_q8_slot(ctx, graph, i + 2, mul, i_mm, K, nrows_K);
     if (!q8) {
-        return 0;
+        // Prefill (no Q8_1 slot): fold only the copy (GGML_HIP_PREFILL_GATE_CONT=0 off)
+        static const bool fold_cont = [] { const char * e = getenv("GGML_HIP_PREFILL_GATE_CONT"); return !e || std::atoi(e) != 0; }();
+        if (!fold_cont) {
+            return 0;
+        }
+        ggml_cuda_unary_gated_strided(op, (const float *) view->data, (const float *) g->data, (float *) mul->data,
+            ggml_nelements(mul), cont->ne[0], view->nb[2]/sizeof(float), g->nb[1]/sizeof(float), view->ne[0],
+            view->nb[1]/sizeof(float), ctx.stream());
+        return 2;
     }
     ggml_cuda_unary_gated_q8_1(op, (const float *) view->data, (const float *) g->data, (float *) mul->data, q8,
         cont->ne[0], view->nb[2]/sizeof(float), g->nb[1]/sizeof(float), K, nrows_K, ctx.stream(),
@@ -6224,6 +6238,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                         cuda_ctx->mmvq_cache.invalidate_write(cgraph->nodes[j]);
                         cuda_ctx->mmq_cache.invalidate_write(cgraph->nodes[j]);
                         cuda_ctx->mmq_ids_cache.invalidate_write(cgraph->nodes[j]);
+                        cuda_ctx->fa_bounds_cache.invalidate_write(cgraph->nodes[j]);
                     }
                     cuda_ctx->mmvq_cache.commit();
                     cuda_ctx->mmq_cache.commit();
@@ -6265,6 +6280,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     cuda_ctx->mmvq_cache.invalidate_write(node);
                     cuda_ctx->mmq_cache.invalidate_write(node);
                     cuda_ctx->mmq_ids_cache.invalidate_write(node);
+                    cuda_ctx->fa_bounds_cache.invalidate_write(node);
                     continue;
                 }
 #endif
@@ -6277,6 +6293,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 cuda_ctx->mmvq_cache.invalidate_write(node);
                 cuda_ctx->mmq_cache.invalidate_write(node);
                 cuda_ctx->mmq_ids_cache.invalidate_write(node);
+                cuda_ctx->fa_bounds_cache.invalidate_write(node);
 #endif
 
                 if (!is_concurrent_event_active) {
@@ -6354,6 +6371,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cache.reset();
     cuda_ctx->mmq_cache.reset();
     cuda_ctx->mmq_ids_cache.reset();
+    cuda_ctx->fa_bounds_cache.reset();
     cuda_ctx->f32_pair.partner = nullptr;
     cuda_ctx->gdn_deferred_gather.clear();
     cache.enabled = !disable_mmvq_cache && cuda_ctx->stream_context().concurrent_events.empty() &&

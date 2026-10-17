@@ -100,6 +100,10 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
 void ggml_cuda_unary_gated_q8_1(ggml_unary_op op, const float * x, const float * g, float * dst, void * q8,
         int64_t nc, int64_t o0, int64_t o1, int64_t K, int64_t nrows_K, cudaStream_t stream,
         int64_t x_inner = 0, int64_t x_s_inner = 0);
+
+// dst = op(x) * g for k values of nc per row, without the Q8_1 copy; x rows are views of x_inner-value pieces x_s_inner floats apart.
+void ggml_cuda_unary_gated_strided(ggml_unary_op op, const float * x, const float * g, float * dst, int64_t k,
+        int64_t nc, int64_t o0, int64_t o1, int64_t x_inner, int64_t x_s_inner, cudaStream_t stream);
 #endif
 
 void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);

@@ -826,6 +826,37 @@ void ggml_cuda_unary_gated_q8_1(ggml_unary_op op, const float * x, const float *
     }
     CUDA_CHECK(cudaGetLastError());
 }
+
+// dst = op(x) * g with the expression of unary_gated_op_kernel, x rows a strided view of x_inner-value pieces (the copy of
+// a non-contiguous gate folded in)
+template <float (*op)(float)>
+static __global__ void unary_gated_strided_kernel(const float * x, const float * g, float * dst, const int64_t k, const int64_t nc,
+        const int64_t o0, const int64_t o1, const int64_t x_inner, const int64_t x_s_inner) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+    if (i >= k) {
+        return;
+    }
+    const int64_t r  = i / nc;
+    const int64_t c  = i - r*nc;
+    const int64_t xp = c / x_inner;
+    dst[i] = op(x[r*o0 + xp*x_s_inner + (c - xp*x_inner)]) * g[r*o1 + c];
+}
+
+void ggml_cuda_unary_gated_strided(ggml_unary_op op, const float * x, const float * g, float * dst, const int64_t k,
+        const int64_t nc, const int64_t o0, const int64_t o1, const int64_t x_inner, const int64_t x_s_inner, cudaStream_t stream) {
+    const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+    switch (op) {
+        case GGML_UNARY_OP_SILU:
+            unary_gated_strided_kernel<op_silu><<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, nc, o0, o1, x_inner, x_s_inner);
+            break;
+        case GGML_UNARY_OP_SIGMOID:
+            unary_gated_strided_kernel<op_sigmoid><<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, nc, o0, o1, x_inner, x_s_inner);
+            break;
+        default:
+            GGML_ABORT("unsupported op");
+    }
+    CUDA_CHECK(cudaGetLastError());
+}
 #endif // defined(GGML_USE_HIP)
 
 /* fused relu + sqr */

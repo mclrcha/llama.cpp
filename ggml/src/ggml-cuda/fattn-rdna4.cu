@@ -92,7 +92,18 @@ static __global__ void fattn_rdna4_kv_bounds_init(int2 * __restrict__ KV_bounds,
     }
 }
 
-template <int NW, bool use_mask>
+// 8 values of a q8_0 block with scale d, same arithmetic as flash_attn_tile_load_tile_q8_0.
+static __device__ __forceinline__ void fattn_r4d_dequant8(const int2 q, const half d, half2 * v) {
+    const half2 d2 = __half2half2(d);
+    const char4 a = *((const char4 *) &q.x);
+    const char4 b = *((const char4 *) &q.y);
+    v[0] = __hmul2(make_half2(a.x, a.y), d2);
+    v[1] = __hmul2(make_half2(a.z, a.w), d2);
+    v[2] = __hmul2(make_half2(b.x, b.y), d2);
+    v[3] = __hmul2(make_half2(b.z, b.w), d2);
+}
+
+template <int NW, bool use_mask, bool q8>
 __launch_bounds__(NW*WARP_SIZE, 1)
 static __global__ void fattn_rdna4_d256(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
@@ -172,6 +183,9 @@ static __global__ void fattn_rdna4_d256(
         int4 m;
         int4 k0, k1, k2, k3;
         int4 v0, v1, v2, v3;
+        // q8: the 8 quants and the scale of each chunk, dequantized into k0..v3 right before the SRAM store
+        int2 kq[4], vq[4];
+        half kd[4], vd[4];
     };
     auto load_mask = [&](stage & st, const int kv0) {
         st.m = *(const int4 *) (mrow + int64_t(kv0 + 16*c + 8*h)*sizeof(half));
@@ -179,6 +193,26 @@ static __global__ void fattn_rdna4_d256(
     auto load_tile = [&](stage & st, const int kv0, auto with_mask) {
         if constexpr (decltype(with_mask)::value) {
             load_mask(st, kv0);
+        }
+        if constexpr (q8) {
+            // chunk of 8 values c: q8_0 block c/4, quants at byte 2 + 8 (c % 4) (2 byte aligned loads)
+            const char * k0 = Kh + int64_t(kv0 + krow)*nb11 + 34*(kcol >> 2);
+            const int ko = 2 + 8*(kcol & 3);
+#pragma unroll
+            for (int i = 0; i < (NW == 8 ? 4 : 2); ++i) {
+                const char * kr = k0 + int64_t(NW*i)*nb11;
+                st.kd[i] = *(const half *) kr;
+                st.kq[i] = *(const int2 *) (kr + ko);
+            }
+            const char * v0 = Vh + int64_t(kv0 + 2*lq)*nb21;
+#pragma unroll
+            for (int i = 0; i < (NW == 8 ? 4 : 2); ++i) {
+                const int vc = i < 2 ? vcA : vcB;
+                const char * vr = v0 + (i & 1)*int64_t(nb21) + 34*(vc >> 2);
+                st.vd[i] = *(const half *) vr;
+                st.vq[i] = *(const int2 *) (vr + 2 + 8*(vc & 3));
+            }
+            return;
         }
         const char * k0 = Kh + int64_t(kv0 + krow)*nb11 + kcol*16;
         st.k0 = *(const int4 *) (k0);
@@ -211,6 +245,15 @@ static __global__ void fattn_rdna4_d256(
         constexpr bool M = decltype(with_mask)::value;
         fattn_r4_lds_barrier(); // previous step is done with K, V^T and S in SRAM
 
+        if constexpr (q8) {
+            int4 * kk[4] = {&st.k0, &st.k1, &st.k2, &st.k3};
+            int4 * vv[4] = {&st.v0, &st.v1, &st.v2, &st.v3};
+#pragma unroll
+            for (int i = 0; i < (NW == 8 ? 4 : 2); ++i) {
+                fattn_r4d_dequant8(st.kq[i], st.kd[i], (half2 *) kk[i]);
+                fattn_r4d_dequant8(st.vq[i], st.vd[i], (half2 *) vv[i]);
+            }
+        }
         {
             half * k0 = sK + krow*K_STRIDE + kcol*8;
             *(int4 *) (k0)               = st.k0;
@@ -491,6 +534,28 @@ bool ggml_cuda_flash_attn_ext_rdna4_supported(int device, const ggml_tensor * ds
 #endif // defined(GGML_USE_HIP)
 }
 
+// GGML_HIP_FA_R4_Q8=1: the prefill kernel reads q8_0 K/V directly (bit-identical). It saves the f16 copy of the KV cache
+// (4 KiB of VRAM per context cell at D=256 with 4 KV heads) but the in-kernel dequantization makes FA 3-5% slower at 32k-64k.
+bool ggml_cuda_flash_attn_ext_rdna4_reads_q8(int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = [] { const char * e = getenv("GGML_HIP_FA_R4_Q8"); return e && std::atoi(e) != 0; }();
+    if (!enabled || !ggml_cuda_flash_attn_ext_rdna4_supported(device, dst)) {
+        return false;
+    }
+    // q8_0 rows: the scales are read as 2 byte values, the quants as 8 byte (2 byte aligned) values.
+    for (const ggml_tensor * T : {dst->src[1], dst->src[2]}) {
+        if (T->type != GGML_TYPE_Q8_0 || T->nb[0] != ggml_type_size(T->type) || T->nb[1] % 2 || T->nb[2] % 2 || T->nb[3] % 2 ||
+                (uintptr_t) T->data % 2 || T->nb[1] > INT_MAX || T->nb[2] > INT_MAX) {
+            return false;
+        }
+    }
+    return true;
+#else
+    GGML_UNUSED_VARS(device, dst);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
 // Converts a quantized K or V into the f16 buffer reserved after dst (same as launch_fattn).
 static const char * fattn_rdna4_to_f16(const ggml_tensor * T, half * T_f16, size_t & nb1, size_t & nb2, size_t & nb3, cudaStream_t stream) {
     const size_t bs = ggml_blck_size(T->type);
@@ -521,17 +586,18 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
     cudaStream_t stream = ctx.stream();
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
-    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, true, true);
+    const bool q8 = ggml_cuda_flash_attn_ext_rdna4_reads_q8(ctx.device, dst);
+    const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, !q8, !q8);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1], nb12 = K->nb[2], nb13 = K->nb[3];
-    if (K->type != GGML_TYPE_F16) {
+    if (K->type != GGML_TYPE_F16 && !q8) {
         GGML_ASSERT(f16_extra.K != 0);
         K_data = fattn_rdna4_to_f16(K, (half *) f16_extra.K, nb11, nb12, nb13, stream);
     }
     const char * V_data = (const char *) V->data;
     size_t nb21 = V->nb[1], nb22 = V->nb[2], nb23 = V->nb[3];
-    if (V->type != GGML_TYPE_F16) {
+    if (V->type != GGML_TYPE_F16 && !q8) {
         if (V_is_K_view) {
             V_data = K_data;
             nb21 = nb11; nb22 = nb12; nb23 = nb13;
@@ -564,23 +630,38 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
     const int     nb31 = mask ? mask->nb[1] : 0;
     const int64_t nb33 = mask && mask->ne[3] > 1 ? mask->nb[3] : 0;
 
-    ggml_cuda_pool_alloc<int2> KV_bounds(ctx.pool());
+    // The bounds depend only on the mask and the tiling: the attention layers of a graph share them.
+    static const bool bounds_cache = [] { const char * e = getenv("GGML_HIP_FA_BOUNDS_CACHE"); return !e || std::atoi(e) != 0; }();
+    ggml_cuda_pool_alloc<int2> KV_bounds_pool(ctx.pool());
+    const int2 * KV_bounds = nullptr;
     if (mask) {
         const int nchunks = (ne11 + fattn_r4::KV_MAX_STEP - 1)/fattn_r4::KV_MAX_STEP;
         const int n = ntiles*ne03;
-        KV_bounds.alloc(n);
-        fattn_rdna4_kv_bounds_init<<<(n + 255)/256, 256, 0, stream>>>(KV_bounds.get(), n, nchunks);
-        fattn_rdna4_kv_bounds<<<dim3(ntiles, nchunks, ne03), fattn_r4::KV_MAX_STEP, 0, stream>>>(
-            (const char *) mask->data, KV_bounds.get(), ne01, ne11, nb31, nb33, nq);
-        CUDA_CHECK(cudaGetLastError());
+        const int64_t key[6] = {ne01, ne11, nq, ne03, nb31, nb33};
+        auto & cache = ctx.fa_bounds_cache;
+        const int slot = bounds_cache ? cache.find((const char *) mask->data, key) : -1;
+        if (slot >= 0) {
+            KV_bounds = (const int2 *) cache.data[slot];
+        } else {
+            int2 * out = bounds_cache && size_t(n) <= ggml_hip_fa_bounds_cache::capacity ?
+                cache.acquire((const char *) mask->data, ggml_nbytes(mask), key, stream) : nullptr;
+            if (!out) {
+                out = KV_bounds_pool.alloc(n);
+            }
+            fattn_rdna4_kv_bounds_init<<<(n + 255)/256, 256, 0, stream>>>(out, n, nchunks);
+            fattn_rdna4_kv_bounds<<<dim3(ntiles, nchunks, ne03), fattn_r4::KV_MAX_STEP, 0, stream>>>(
+                (const char *) mask->data, out, ne01, ne11, nb31, nb33, nq);
+            CUDA_CHECK(cudaGetLastError());
+            KV_bounds = out;
+        }
     }
 
     const dim3 grid(ntiles, ne02 >> hp_log2, ne03);
     const dim3 block(WARP_SIZE, nw);
     const float scale_log2 = scale*1.4426950408889634f;
     const int gqa_ratio = ne02 / K->ne[2];
-#define FATTN_R4_LAUNCH(NW, M) fattn_rdna4_d256<NW, M><<<grid, block, fattn_r4::smem(NW), stream>>>( \
-            (const char *) Q->data, K_data, V_data, mask ? (const char *) mask->data : nullptr, mask ? KV_bounds.get() : nullptr, (float *) dst->data, \
+#define FATTN_R4_LAUNCH(NW, M) (q8 ? fattn_rdna4_d256<NW, M, true> : fattn_rdna4_d256<NW, M, false>)<<<grid, block, fattn_r4::smem(NW), stream>>>( \
+            (const char *) Q->data, K_data, V_data, mask ? (const char *) mask->data : nullptr, KV_bounds, (float *) dst->data, \
             scale_log2, ne01, ne02, ne11, gqa_ratio, Q->nb[1], Q->nb[2], Q->nb[3], \
             nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, hp_log2)
     if (nw == 16) {
@@ -622,16 +703,6 @@ constexpr int SMEM      = K_BYTES + VT_BYTES + NW*256*4;
 constexpr int QB        = 34;         // bytes per q8_0 block
 }
 
-// 8 values of a q8_0 block with scale d, same arithmetic as flash_attn_tile_load_tile_q8_0.
-static __device__ __forceinline__ void fattn_r4d_dequant8(const int2 q, const half d, half2 * v) {
-    const half2 d2 = __half2half2(d);
-    const char4 a = *((const char4 *) &q.x);
-    const char4 b = *((const char4 *) &q.y);
-    v[0] = __hmul2(make_half2(a.x, a.y), d2);
-    v[1] = __hmul2(make_half2(a.z, a.w), d2);
-    v[2] = __hmul2(make_half2(b.x, b.y), d2);
-    v[3] = __hmul2(make_half2(b.z, b.w), d2);
-}
 
 __launch_bounds__(fattn_r4d::NW*WARP_SIZE, 1)
 static __global__ void fattn_rdna4_dec_q8(

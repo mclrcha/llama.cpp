@@ -736,14 +736,19 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            // the RDNA4 kernels read q8_0 K/V directly: no f16 copy of the KV cache
+            need_f16_K = !ggml_cuda_flash_attn_ext_rdna4_dec_supported(device, dst);
+            need_f16_V = need_f16_K;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
-            need_f16_K = true;
-            need_f16_V = true;
+            need_f16_K = !ggml_cuda_flash_attn_ext_rdna4_reads_q8(device, dst);
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;
-            need_f16_K = K->type == GGML_TYPE_F32 || f16_fallback;
-            need_f16_V = V->type == GGML_TYPE_F32 || f16_fallback;
+            const bool rdna4_dec = ggml_cuda_flash_attn_ext_rdna4_dec_supported(device, dst);
+            need_f16_K = !rdna4_dec && (K->type == GGML_TYPE_F32 || f16_fallback);
+            need_f16_V = !rdna4_dec && (V->type == GGML_TYPE_F32 || f16_fallback);
         } break;
         case BEST_FATTN_KERNEL_NONE:
             break;

@@ -1740,6 +1740,64 @@ struct ggml_hip_mmq_ids_cache {
 #endif
 
 #if defined(GGML_USE_HIP)
+// KV bounds of the RDNA4 prefill FlashAttention (fattn-rdna4.cu) depend only on the mask, so the attention layers of a graph
+// share them: valid within one graph evaluation until a node writes over the mask (GGML_HIP_FA_BOUNDS_CACHE=0 off).
+struct ggml_hip_fa_bounds_cache {
+    static constexpr int    n_slots  = 2;
+    static constexpr size_t capacity = 1 << 16; // int2 entries per slot
+
+    void *       data[n_slots]       = {nullptr};
+    const char * mask[n_slots]       = {nullptr};
+    size_t       mask_bytes[n_slots] = {0};
+    int64_t      key[n_slots][6]     = {};
+    bool         valid[n_slots]      = {};
+    int          next = 0;
+
+    int find(const char * mask_, const int64_t (&key_)[6]) const {
+        for (int k = 0; k < n_slots; ++k) {
+            if (valid[k] && mask[k] == mask_ && std::equal(key_, key_ + 6, key[k])) {
+                return k;
+            }
+        }
+        return -1;
+    }
+
+    // Returns the buffer of a slot for these bounds, or nullptr if it cannot be allocated (stream capture).
+    int2 * acquire(const char * mask_, const size_t mask_bytes_, const int64_t (&key_)[6], cudaStream_t stream) {
+        const int k = next;
+        if (!data[k]) {
+            hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+            CUDA_CHECK(hipStreamIsCapturing(stream, &status));
+            if (status != hipStreamCaptureStatusNone) {
+                return nullptr;
+            }
+            CUDA_CHECK(cudaMalloc(&data[k], capacity*sizeof(int2)));
+        }
+        next          = (k + 1) % n_slots;
+        mask[k]       = mask_;
+        mask_bytes[k] = mask_bytes_;
+        std::copy(key_, key_ + 6, key[k]);
+        valid[k]      = true;
+        return (int2 *) data[k];
+    }
+
+    void reset() {
+        for (int k = 0; k < n_slots; ++k) {
+            valid[k] = false;
+        }
+    }
+
+    void invalidate_write(const ggml_tensor * dst) {
+        const uintptr_t b = reinterpret_cast<uintptr_t>(dst->data);
+        for (int k = 0; k < n_slots; ++k) {
+            const uintptr_t a = reinterpret_cast<uintptr_t>(mask[k]);
+            if (valid[k] && a < b + ggml_nbytes(dst) && b < a + mask_bytes[k]) {
+                valid[k] = false;
+            }
+        }
+    }
+};
+
 // Host inputs of a graph split, uploaded by one kernel instead of one copy each (ggml_backend_cuda_set_tensors_gather_async).
 // The data are copied to a slot of mapped, coherent pinned memory first, so the caller can overwrite them right away and
 // the scheduler does not wait for the upload; a slot is reused once its kernel has finished (GGML_HIP_INPUT_GATHER=0 off).
@@ -1772,6 +1830,7 @@ struct ggml_backend_cuda_context {
     ggml_hip_mmvq_cache mmvq_cache;
     ggml_hip_mmq_cache  mmq_cache;
     ggml_hip_mmq_ids_cache mmq_ids_cache;
+    ggml_hip_fa_bounds_cache fa_bounds_cache;
     ggml_hip_input_gather  input_gather;
     // prefill f32 projections run as one batched GEMM with a later sibling (see ggml_cuda_mul_mat_f32_pair)
     struct {

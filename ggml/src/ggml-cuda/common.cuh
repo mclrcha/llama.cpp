@@ -1816,6 +1816,8 @@ struct ggml_hip_input_gather {
 };
 #endif
 
+struct ggml_cuda_gdn_journal;
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1846,6 +1848,7 @@ struct ggml_backend_cuda_context {
     // GATED_DELTA_NET nodes whose initial state gather (GET_ROWS of the recurrent cache) was skipped: the op reads the
     // state from the cache row instead. Filled and consumed during one graph evaluation.
     std::unordered_map<const ggml_tensor *, const ggml_tensor *> gdn_deferred_gather;
+    std::shared_ptr<ggml_cuda_gdn_journal> gdn_journal;
 #endif
 
 #ifdef USE_CUDA_GRAPH

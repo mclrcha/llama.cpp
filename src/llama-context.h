@@ -26,6 +26,7 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
+class llama_memory_recurrent;
 
 // stores copy of the memory in device buffer. used for fast state save/load
 struct llama_memory_buffer {
@@ -124,6 +125,7 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    bool set_mtp_draft_candidates(const llama_token * ids, size_t count);
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -271,6 +273,11 @@ public:
 private:
     llm_graph_result * get_gf_res_prev();
 
+    void gdn_journal_init();
+    void gdn_journal_flush();
+    void gdn_journal_commit();
+    void gdn_journal_configure(ggml_cgraph * graph, const llama_ubatch & ubatch);
+
     llm_graph_params graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
@@ -313,6 +320,15 @@ private:
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
 
     llama_memory_ptr memory;
+    llama_memory_recurrent * gdn_memory = nullptr;
+    ggml_backend_t gdn_backend = nullptr;
+    int (*gdn_control)(ggml_backend_t, int, int) = nullptr;
+    llama_seq_id gdn_seq = -1;
+    int gdn_layers = 0;
+    uint64_t gdn_commits = 0;
+    uint64_t gdn_flushes = 0;
+    uint32_t gdn_debug_logs = 0;
+
     llama_moe_cache_ptr moe_cache;
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
@@ -350,6 +366,8 @@ private:
     };
 
     sampling_info sampling;
+
+    std::vector<llama_token> mtp_draft_candidates;
 
     // sequence embeddings output (map of [n_embd] vectors)
     // populated only when pooling_type != LLAMA_POOLING_TYPE_NONE

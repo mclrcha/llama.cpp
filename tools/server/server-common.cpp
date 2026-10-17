@@ -33,6 +33,22 @@
 #include <unistd.h>
 #endif
 
+std::list<common_prompt_checkpoint>::iterator server_checkpoint_victim(std::list<common_prompt_checkpoint> & checkpoints) {
+    auto victim = checkpoints.end();
+    double smallest = std::numeric_limits<double>::infinity();
+    int64_t previous = 0;
+    for (auto it = checkpoints.begin(); it != checkpoints.end(); ++it) {
+        const double gap = std::max(0.0, double(it->n_tokens) - double(previous));
+        const double cost = gap*(1.0 + std::min<uint32_t>(it->reuse_count, 8));
+        if (cost < smallest) {
+            smallest = cost;
+            victim = it;
+        }
+        previous = std::max(previous, it->n_tokens);
+    }
+    return victim;
+}
+
 json format_error_response(const std::string & message, const enum error_type type) {
     std::string type_str;
     int code = 500;

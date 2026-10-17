@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "speculative-vocab.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
@@ -1477,6 +1478,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    common_speculative_vocab dynamic_vocab;
+    std::vector<llama_token> dynamic_priority;
+
+    void update_dynamic_priority(int32_t row) {
+        dynamic_priority.clear();
+        if (!dynamic_vocab.capacity || row < 0) {
+            return;
+        }
+        int32_t count = 0;
+        const llama_token * ids = nullptr;
+        const float * values = nullptr;
+        if (llama_get_logits_topk_ith(params.ctx_tgt, row, &count, &ids, &values) && ids && count > 0) {
+            dynamic_priority.assign(ids, ids + std::min<int32_t>(count, 64));
+        }
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1543,6 +1560,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
+        const char * vocab_env = getenv("LLAMA_MTP_DYNAMIC_VOCAB");
+        if (vocab_env && n_seq == 1 && !chain_heads && !is_mem_shared && !this->params.probabilistic &&
+                !backend_chains.empty() && backend_chains[0]) {
+            char * end = nullptr;
+            const long count = std::strtol(vocab_env, &end, 10);
+            if (end != vocab_env && *end == '\0' && count >= 16 && count <= 65536) {
+                dynamic_vocab.configure(llama_mtp_draft_vocab_size(ctx_dft), int32_t(count));
+                SPC_INF("dynamic MTP draft vocabulary: %d of %d rows\n", dynamic_vocab.capacity, dynamic_vocab.n_vocab);
+            }
+        }
+
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
@@ -1570,6 +1598,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
+
+        if (dynamic_vocab.capacity) {
+            dynamic_vocab.recent.clear();
+            dynamic_priority.clear();
+            for (size_t i = prompt.size() > 3072 ? prompt.size() - 3072 : 0; i < prompt.size(); ++i) {
+                dynamic_vocab.observe(prompt[i]);
+            }
+            llama_set_mtp_draft_candidates(params.ctx_dft, nullptr, 0);
+        }
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
@@ -1700,6 +1737,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             std::memcpy(pending_h[seq_id].data(),
                     llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_end[seq_id]), row_bytes);
+            if (dynamic_vocab.capacity && seq_id == 0) {
+                update_dynamic_priority(i_batch_end[seq_id]);
+            }
         }
 
         return true;
@@ -1707,6 +1747,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
+
+        if (dynamic_vocab.capacity) {
+            if (!dparams.empty()) {
+                dynamic_vocab.observe(dparams[0].id_last);
+            }
+            auto selected = dynamic_vocab.select(dynamic_priority.data(), dynamic_priority.size());
+            if (!llama_set_mtp_draft_candidates(ctx_dft, selected.data(), selected.size())) {
+                llama_set_mtp_draft_candidates(ctx_dft, nullptr, 0);
+            }
+        }
 
         batch.clear();
 
@@ -1790,6 +1840,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
+                if (dynamic_vocab.capacity) {
+                    for (size_t k = 0; k < std::min<size_t>(3, cur_p->size); ++k) {
+                        dynamic_vocab.observe(cur_p->data[k].id);
+                    }
+                }
+
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
                             seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
@@ -1871,6 +1927,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (!dynamic_vocab.capacity || seq_id != 0) {
+            return false;
+        }
+        const uint32_t header[] = { 0x3256444d, uint32_t(dynamic_vocab.recent.size()), uint32_t(dynamic_priority.size()) };
+        data.resize(sizeof(header) + (header[1] + header[2])*sizeof(int32_t));
+        std::memcpy(data.data(), header, sizeof(header));
+        size_t offset = sizeof(header);
+        for (int32_t id : dynamic_vocab.recent) {
+            std::memcpy(data.data() + offset, &id, sizeof(id));
+            offset += sizeof(id);
+        }
+        if (!dynamic_priority.empty()) {
+            std::memcpy(data.data() + offset, dynamic_priority.data(), dynamic_priority.size()*sizeof(int32_t));
+        }
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (!dynamic_vocab.capacity || seq_id != 0) {
+            return;
+        }
+        dynamic_vocab.recent.clear();
+        dynamic_priority.clear();
+        llama_set_mtp_draft_candidates(params.ctx_dft, nullptr, 0);
+        uint32_t header[3];
+        if (data.size() < sizeof(header)) {
+            return;
+        }
+        std::memcpy(header, data.data(), sizeof(header));
+        if (header[0] != 0x3256444d || header[1] > 3072 || header[2] > 64 ||
+                data.size() != sizeof(header) + (header[1] + header[2])*sizeof(int32_t)) {
+            return;
+        }
+        for (uint32_t i = 0; i < header[1]; ++i) {
+            int32_t id;
+            std::memcpy(&id, data.data() + sizeof(header) + i*sizeof(id), sizeof(id));
+            dynamic_vocab.observe(id);
+        }
+        dynamic_priority.resize(header[2]);
+        if (!dynamic_priority.empty()) {
+            std::memcpy(dynamic_priority.data(), data.data() + sizeof(header) + header[1]*sizeof(int32_t),
+                    dynamic_priority.size()*sizeof(int32_t));
+        }
+    }
+
     // rows of a processed batch that accept() can read (n_accepted is at most the number of drafted tokens)
     int32_t verify_h_max_rows() const {
         return std::max<int32_t>(params.n_max, 16) + 1;
@@ -1887,6 +1989,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
+        if (dynamic_vocab.capacity && seq_id == 0) {
+            update_dynamic_priority(i_batch_beg[seq_id] + i_h);
+        }
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         if (i_h == n_rows - 1) {
             // the last row is also kept in pending_h (process() copies it there)

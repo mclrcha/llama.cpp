@@ -2542,14 +2542,33 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+        if (params_base.n_ctx_checkpoints <= 0) {
+            return;
+        }
         const int id_task = slot.task->id;
+        static const bool retain = [] {
+            const char * value = getenv("LLAMA_CHECKPOINT_RETAIN");
+            return !value || std::atoi(value) != 0;
+        }();
+        uint32_t reuse_count = 0;
+        if (retain) {
+            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                if (it->n_tokens == n_tokens_new) {
+                    reuse_count = std::max(reuse_count, it->reuse_count);
+                    it = slot.prompt.checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
         int64_t last = -1;
         for (auto it = slot.prompt.checkpoints.begin();
-                slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
+                !retain && slot.prompt.checkpoints.size() + 1 >= (size_t) params_base.n_ctx_checkpoints &&
                 it != slot.prompt.checkpoints.end(); ) {
             if (it->id_task != id_task && last >= 0 && it->n_tokens <= last + params_base.checkpoint_min_step) {
                 SLT_TRC(slot, "erasing context checkpoint too close to an earlier one (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -2565,12 +2584,13 @@ private:
 
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
             // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            auto victim = retain ? server_checkpoint_victim(slot.prompt.checkpoints) : slot.prompt.checkpoints.begin();
+            const auto & cur = *victim;
 
             SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
                     cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(victim);
         }
 
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
@@ -2589,6 +2609,7 @@ private:
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
         cur.id_task = id_task;
+        cur.reuse_count = reuse_count;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
@@ -3882,6 +3903,7 @@ private:
                                     if (!do_reset) {
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+                                        it->reuse_count = std::min<uint32_t>(it->reuse_count, 8) + 1;
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);

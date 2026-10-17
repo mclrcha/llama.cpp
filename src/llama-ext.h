@@ -108,6 +108,11 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Restrict an MTP draft head to these token IDs. An empty list restores the normal head.
+// Requires the existing quantized draft head and backend sampling; does not change the target.
+LLAMA_API bool llama_set_mtp_draft_candidates(struct llama_context * ctx, const llama_token * ids, size_t count);
+LLAMA_API int32_t llama_mtp_draft_vocab_size(const struct llama_context * ctx);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

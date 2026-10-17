@@ -4535,10 +4535,11 @@ static int ggml_cuda_try_prefill_norm_gate(ggml_backend_cuda_context & ctx, ggml
     }
     if (!mmq) {
         const int slot = (ctx.mmdq_cache.last + 1) % ggml_hip_mmq_cache::nslots;
-        half * f16 = (half *) ctx.mmdq_cache.reserve(slot, src1, 0, ggml_nbytes(src1)/2, ctx.stream());
+        const int layout = ggml_cuda_mmdq_layout(src1);
+        half * f16 = (half *) ctx.mmdq_cache.reserve(slot, src1, layout, ggml_nbytes(src1)/2, ctx.stream());
         GGML_ASSERT(f16);
         ggml_cuda_norm_gate_f16((const float *) x->data, (const float *) weight->data, (const float *) gate->data,
-            ggml_get_op_params_f32(norm, 0), f16, int(x->ne[1]), int(x->ne[2]), ctx.stream());
+            ggml_get_op_params_f32(norm, 0), f16, int(x->ne[1]), int(x->ne[2]), ctx.stream(), layout);
         // The graph loop commits the slot after invalidating the skipped F32 writes.
         return u + 1 - i;
     }
@@ -4668,6 +4669,96 @@ static const ggml_tensor * ggml_cuda_gdn_gather_consumer(ggml_backend_cuda_conte
         }
     }
     return gdn;
+}
+
+// Deferred snapshots are safe only when every recurrent layer uses the indexed cache fusion.
+static bool ggml_cuda_gdn_journal_preflight(ggml_backend_cuda_context & ctx, const ggml_cgraph * graph) {
+    static const bool debug = [] {
+        const char * env = getenv("LLAMA_GDN_JOURNAL_DEBUG");
+        return env && std::atoi(env) == 1;
+    }();
+    static thread_local uint32_t reported = 0;
+    const auto report = [&](unsigned reason, const char * message, const ggml_tensor * gdn = nullptr,
+                            const ggml_tensor * conflict = nullptr, const ggml_tensor * input = nullptr) {
+        if (debug && !(reported & (1u << reason))) {
+            reported |= 1u << reason;
+            GGML_LOG_INFO("gdn_journal_preflight: reason=%s nodes=%d gdn=%s conflict=%s conflict_op=%s input=%s view_src=%s tokens=%lld slots=%d\n",
+                message, graph->n_nodes, gdn ? gdn->name : "-", conflict ? conflict->name : "-",
+                conflict ? ggml_op_name(conflict->op) : "-", input ? input->name : "-",
+                input && input->view_src ? input->view_src->name : "-", (long long) (gdn ? gdn->src[2]->ne[2] : 0),
+                gdn ? ggml_get_op_params_i32(gdn, 0) : 0);
+        }
+        return reason == 0;
+    };
+    if (ggml_cuda_fusion_disabled() || ctx.curr_stream_no != 0 || !ctx.stream_context().concurrent_events.empty()) {
+        return report(1, "fusion_or_stream");
+    }
+    bool found = false;
+    const auto overlaps = [](const ggml_tensor * t, const void * data, size_t bytes) {
+        if (!t || !t->data || !data || ggml_is_empty(t)) { return false; }
+        const uintptr_t a = reinterpret_cast<uintptr_t>(t->data), b = reinterpret_cast<uintptr_t>(data);
+        return a <= b ? b - a < ggml_nbytes(t) : a - b < bytes;
+    };
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * gdn = graph->nodes[i];
+        if (gdn->op == GGML_OP_SSM_SCAN) { return report(2, "ssm_scan"); }
+        if (gdn->op != GGML_OP_GATED_DELTA_NET) { continue; }
+        ggml_cuda_gated_delta_net_fused_cache cache{};
+        const int skip = ggml_cuda_try_gdn_cache_fusion(graph, i, cache);
+        if (!skip || !(gdn->flags & GGML_TENSOR_FLAG_COMPUTE) || !gdn->src[5]) {
+            return report(3, "cache_fusion_or_compute", gdn);
+        }
+        const ggml_tensor * rows = gdn->src[5]->view_src;
+        int rows_idx = -1;
+        for (int j = 0; j < i; ++j) {
+            if (graph->nodes[j] == rows) { rows_idx = j; break; }
+        }
+        if (rows_idx < 0 || !(rows->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                ggml_cuda_gdn_gather_consumer(ctx, graph, rows, rows_idx + 1) != gdn) {
+            return report(4, "indexed_gather", gdn, rows);
+        }
+        const ggml_tensor * cpy = graph->nodes[i + skip];
+        const ggml_tensor * state = rows->src[0];
+        const size_t tail_off = ggml_row_size(GGML_TYPE_F32, ggml_nelements(gdn->src[2]));
+        const char * tail = static_cast<const char *>(gdn->data) + tail_off;
+        const size_t tail_bytes = ggml_nbytes(gdn) - tail_off;
+        const auto reads_tail = [&](const ggml_tensor * tensor) {
+            if (!overlaps(tensor, tail, tail_bytes)) { return false; }
+            // The allocator may reuse this transient scratch after its CPY. Only a declared
+            // GDN/view dependency reads this GDN's tail; another producer at the same address does not.
+            for (const ggml_tensor * origin = tensor; origin; origin = origin->view_src) {
+                if (origin == gdn) { return true; }
+            }
+            return false;
+        };
+        for (int j = i + 1; j < graph->n_nodes; ++j) {
+            const ggml_tensor * consumer = graph->nodes[j];
+            if (consumer == cpy) { continue; }
+            const bool view = ggml_cuda_is_view_or_noop(consumer);
+            if (view && !(consumer->flags & GGML_TENSOR_FLAG_OUTPUT)) { continue; }
+            if (view && reads_tail(consumer)) {
+                return report(5, "output_view_tail", gdn, consumer, consumer);
+            }
+            if (view && overlaps(consumer, state->data, ggml_nbytes(state))) {
+                return report(10, "output_view_state", gdn, consumer, consumer);
+            }
+            if (!view) {
+                if (overlaps(consumer, state->data, ggml_nbytes(state))) {
+                    return report(6, "state_write_overlap", gdn, consumer);
+                }
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (reads_tail(consumer->src[k])) {
+                        return report(7, "input_tail", gdn, consumer, consumer->src[k]);
+                    }
+                    if (overlaps(consumer->src[k], state->data, ggml_nbytes(state))) {
+                        return report(9, "input_state", gdn, consumer, consumer->src[k]);
+                    }
+                }
+            }
+        }
+        found = true;
+    }
+    return found ? report(0, "eligible") : report(8, "no_gdn");
 }
 
 static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int i) {
@@ -4997,6 +5088,74 @@ static int ggml_cuda_try_q8_pair(ggml_backend_cuda_context & ctx,ggml_cgraph * g
 #endif
 
 #if defined(GGML_USE_HIP)
+static int ggml_cuda_try_prefill_gate_up(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    static const bool enabled = [] { const char * e = getenv("GGML_HIP_MMDQ_GATE_UP"); return e && std::atoi(e) != 0; }();
+    static const bool cache_enabled = [] { const char * e = getenv("GGML_HIP_MMDQ_F16_CACHE"); return !e || std::atoi(e) != 0; }();
+    if (!enabled || !cache_enabled || i + 3 >= graph->n_nodes || ctx.curr_stream_no != 0 || !ctx.mmvq_cache.enabled ||
+            !ctx.stream_context().concurrent_events.empty()) { return 0; }
+    auto * a = graph->nodes[i];
+    auto * b = graph->nodes[i + 1];
+    if (!ggml_cuda_mmdq_gate_up_supported(a, b) || a->ne[1] < 1024) { return 0; }
+    auto * activation = graph->nodes[i + 2];
+    const ggml_tensor * gate = nullptr;
+    const ggml_tensor * up = nullptr;
+    int last = i + 2;
+    if (activation->op == GGML_OP_GLU && ggml_get_glu_op(activation) == GGML_GLU_OP_SWIGLU) {
+        gate = activation->src[0];
+        up = activation->src[1];
+    } else if (activation->op == GGML_OP_UNARY && ggml_get_unary_op(activation) == GGML_UNARY_OP_SILU && i + 4 < graph->n_nodes) {
+        gate = activation->src[0];
+        auto * mul = graph->nodes[i + 3];
+        if (mul->op != GGML_OP_MUL || mul->src[0] != activation) { return 0; }
+        up = mul->src[1];
+        activation = mul;
+        ++last;
+    }
+    if (!((gate == a && up == b) || (gate == b && up == a)) || !ggml_are_same_shape(gate, activation)) { return 0; }
+    auto * out = graph->nodes[last + 1];
+    if (out->op != GGML_OP_MUL_MAT || out->src[1] != activation ||
+            !ggml_cuda_mmdq_rdna4_supported(out->src[0], activation, out) ||
+            ggml_nbytes(activation)/2 > ctx.mmdq_cache.max_size) { return 0; }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    for (const auto * mm : {gate, up, static_cast<const ggml_tensor *>(out)}) {
+        if (ggml_cuda_should_use_mmq(mm->src[0]->type, cc, mm->src[1]->ne[1], 0)) { return 0; }
+    }
+    const ggml_tensor * tensors[] = {gate, up, gate->src[0], up->src[0], gate->src[1], out->src[0], activation, out};
+    for (const ggml_tensor * t : tensors) {
+        if (!t->buffer || t->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device) || !ggml_is_contiguous(t)) { return 0; }
+    }
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    CUDA_CHECK(hipStreamIsCapturing(ctx.stream(), &status));
+    if (status != hipStreamCaptureStatusNone) { return 0; }
+    const int output = last + 1;
+    ggml_op ops[5];
+    for (int j = i; j <= output; ++j) { ops[j - i] = graph->nodes[j]->op; }
+    if (!ggml_can_fuse_subgraph(graph, i, output - i + 1, ops, &output, 1)) { return 0; }
+    const auto overlaps = [](const ggml_tensor * lhs, const ggml_tensor * rhs) {
+        const uintptr_t l = (uintptr_t) lhs->data, r = (uintptr_t) rhs->data;
+        return l < r + ggml_nbytes(rhs) && r < l + ggml_nbytes(lhs);
+    };
+    // Preserve the sequential projections: their separate outputs must remain independent, and the first write
+    // cannot replace the input that the second projection still reads. In the SiLU/MUL form, SiLU must preserve up.
+    if (overlaps(gate, up) || overlaps(a, a->src[1]) ||
+            (last == i + 3 && overlaps(graph->nodes[i + 2], up))) { return 0; }
+    // Both kernels finish reading their inputs before the final output can overwrite activation storage.
+    for (const auto * w : {gate->src[0], up->src[0], out->src[0]}) {
+        for (int j = i; j <= output; ++j) {
+            if (overlaps(graph->nodes[j], w)) { return 0; }
+        }
+    }
+    const int slot = (ctx.mmdq_cache.last + 1) % ggml_hip_mmq_cache::nslots;
+    const int layout = ggml_cuda_mmdq_layout(activation);
+    half * f16 = (half *) ctx.mmdq_cache.reserve(slot, activation, layout, ggml_nbytes(activation)/2, ctx.stream());
+    if (!f16) { return 0; }
+    ggml_cuda_mmdq_gate_up(ctx, gate, up, f16, layout);
+    for (int j = i; j <= last; ++j) { ctx.mmdq_cache.invalidate_write(graph->nodes[j]); }
+    ctx.mmdq_cache.commit();
+    ggml_cuda_mmdq_rdna4(ctx, out->src[0], activation, out);
+    return output - i;
+}
+
 static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml_cgraph * graph,int i) {
     static const bool enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_SILU_QUANT"); return !v || atoi(v)!=0; }();
     if(!enabled || ctx.curr_stream_no!=0 || !ctx.mmvq_cache.enabled ||
@@ -5055,20 +5214,23 @@ static int ggml_cuda_try_prefill_silu_quant(ggml_backend_cuda_context & ctx,ggml
     }
     ggml_op ops[3];for(int j=i;j<=last+1;++j) { ops[j-i]=graph->nodes[j]->op; }
     const int output=last+1;
+    static const bool alias_enabled = [] { const char * e = getenv("GGML_HIP_PREFILL_SILU_ALIAS"); return !e || std::atoi(e) != 0; }();
+    const bool staged_f16 = !mmq && alias_enabled;
     if(!ggml_can_fuse_subgraph(graph,i,output-i+1,ops,&output,1) ||
-            (!experts && !ggml_cuda_check_fusion_memory_ranges(graph,i,output-i+1,&output,1))) { return 0; }
+            (!experts && !staged_f16 && !ggml_cuda_check_fusion_memory_ranges(graph,i,output-i+1,&output,1))) { return 0; }
     const auto overlaps=[](const ggml_tensor * a,const ggml_tensor * b) {
         const uintptr_t x=(uintptr_t)a->data,y=(uintptr_t)b->data;
         return x<y+ggml_nbytes(b) && y<x+ggml_nbytes(a);
     };
     // Quantized activations are complete before the expert matmul writes its output.
-    if(overlaps(out,weight) || (!experts && (overlaps(out,gate) || overlaps(out,up)))) { return 0; }
+    if(overlaps(out,weight) || (!experts && !staged_f16 && (overlaps(out,gate) || overlaps(out,up)))) { return 0; }
     if(experts && overlaps(out,out->src[2])) { return 0; }
     if (!mmq) {
         const int slot = (ctx.mmdq_cache.last + 1) % ggml_hip_mmq_cache::nslots;
-        half * f16 = (half *) ctx.mmdq_cache.reserve(slot, activation, 0, ggml_nbytes(activation)/2, ctx.stream());
+        const int layout = ggml_cuda_mmdq_layout(activation);
+        half * f16 = (half *) ctx.mmdq_cache.reserve(slot, activation, layout, ggml_nbytes(activation)/2, ctx.stream());
         GGML_ASSERT(f16);
-        ggml_cuda_silu_f16((const float *) gate->data, (const float *) up->data, f16, ggml_nelements(activation), ctx.stream());
+        ggml_cuda_silu_f16((const float *) gate->data, (const float *) up->data, f16, ggml_nelements(activation), ctx.stream(), activation->ne[0], layout);
         // The sole consumer runs now. The graph loop then invalidates the omitted F32 activation.
         ctx.mmdq_cache.invalidate_write(activation);
         ctx.mmdq_cache.commit();
@@ -5316,6 +5478,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 #if defined(GGML_USE_HIP)
+    const int prefill_gate_up_skip = ggml_cuda_try_prefill_gate_up(*cuda_ctx, cgraph, i);
+    if (prefill_gate_up_skip) { return prefill_gate_up_skip; }
     const int prefill_silu_skip=ggml_cuda_try_prefill_silu_quant(*cuda_ctx,cgraph,i);
     if(prefill_silu_skip) { return prefill_silu_skip; }
     const int swiglu_q8_skip = ggml_cuda_try_swiglu_q8(*cuda_ctx, cgraph, i);
@@ -6455,6 +6619,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     cuda_ctx->fa_bounds_cache.reset();
     cuda_ctx->f32_pair.partner = nullptr;
     cuda_ctx->gdn_deferred_gather.clear();
+    if (cuda_ctx->gdn_journal) {
+        ggml_cuda_gdn_journal_prepare(*cuda_ctx, cgraph, ggml_cuda_gdn_journal_preflight(*cuda_ctx, cgraph));
+    }
     cache.enabled = !disable_mmvq_cache && cuda_ctx->stream_context().concurrent_events.empty() &&
                     GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[cuda_ctx->device].cc);
     // The address remains stable for every captured graph on this context.
@@ -6562,6 +6729,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 #if defined(GGML_USE_HIP)
+    ggml_cuda_gdn_journal_finish(*cuda_ctx);
     cache.reset();
     cache.enabled = false;
 #endif
@@ -7884,6 +8052,22 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+#if defined(GGML_USE_HIP)
+// Private experimental ABI: 0 disable, 1 enable, 2 commit accepted, 3 materialize snapshots, 4 query pending.
+static int ggml_backend_cuda_gdn_journal_control(ggml_backend_t backend, int action, int rollback) {
+    if (!backend || !ggml_backend_is_cuda(backend)) { return 0; }
+    auto & ctx = *static_cast<ggml_backend_cuda_context *>(backend->context);
+    switch (action) {
+        case 0: return ggml_cuda_gdn_journal_enable(ctx, false);
+        case 1: return ggml_cuda_gdn_journal_enable(ctx, true);
+        case 2: return ggml_cuda_gdn_journal_commit(ctx, rollback, false);
+        case 3: return ggml_cuda_gdn_journal_commit(ctx, 0, true);
+        case 4: return ggml_cuda_gdn_journal_pending(ctx);
+        default: return 0;
+    }
+}
+#endif
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -7905,6 +8089,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_get_features;
     }
 #if defined(GGML_USE_HIP)
+    if (strcmp(name, "ggml_backend_cuda_gdn_journal_control") == 0) {
+        return (void *)ggml_backend_cuda_gdn_journal_control;
+    }
     if (strcmp(name, "ggml_backend_set_tensors_gather_async") == 0) {
         return (void *)ggml_backend_cuda_set_tensors_gather_async;
     }

@@ -1740,6 +1740,64 @@ mul_mat_vec_q8_0_q8_1_rdna4_pair(const block_q8_0 * __restrict__ xa, const block
 }
 #endif
 
+#if defined(GGML_USE_HIP)
+// Same dot products and reduction as dense MMVQ, gathering only the requested rows.
+template <ggml_type type>
+static __global__ void mul_mat_vec_q_indexed_rows(
+        const void * weights, const block_q8_1 * input, const int32_t * ids, float * dst,
+        int ncols, int nrows, int count, int stride) {
+    constexpr int qi = ggml_cuda_type_traits<type>::qi;
+    constexpr int qk = ggml_cuda_type_traits<type>::qk;
+    constexpr int vdr = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nw = calc_nwarps(type, 1, get_device_table_id());
+    constexpr int nr = calc_rows_per_block(1, get_device_table_id(), false, nw);
+    constexpr int step = vdr*nw*warp_size/qi;
+    constexpr auto dot = get_vec_dot_q_cuda(type);
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+    const int row0 = blockIdx.x*nr;
+    int offsets[nr];
+    bool valid[nr];
+#pragma unroll
+    for (int i = 0; i < nr; ++i) {
+        const int id = row0 + i < count ? ids[row0 + i] : -1;
+        valid[i] = id >= 0 && id < nrows;
+        offsets[i] = valid[i] ? id*stride : 0;
+    }
+    float sums[nr] = {};
+#pragma unroll 2
+    for (int k = tid/(qi/vdr); k < ncols/qk; k += step) {
+        const int qs = vdr*(tid%(qi/vdr));
+#pragma unroll
+        for (int i = 0; i < nr; ++i) {
+            sums[i] += dot(weights, input + k*(qk/QK8_1), offsets[i] + k, qs);
+        }
+    }
+    __shared__ float partial[nw > 1 ? nw - 1 : 1][nr][warp_size];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < nr; ++i) {
+            partial[threadIdx.y - 1][i][threadIdx.x] = sums[i];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+#pragma unroll
+    for (int i = 0; i < nr; ++i) {
+#pragma unroll
+        for (int w = 0; w < nw - 1; ++w) {
+            sums[i] += partial[w][i][threadIdx.x];
+        }
+        sums[i] = warp_reduce_sum<warp_size>(sums[i]);
+        if (threadIdx.x == i && row0 + i < count) {
+            dst[row0 + i] = valid[i] ? sums[i] : 0.0f;
+        }
+    }
+}
+#endif
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1991,6 +2049,26 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+#if defined(GGML_USE_HIP)
+    static const bool indexed_rows = [] {
+        const char * value = getenv("GGML_HIP_MMVQ_INDEXED_ROWS");
+        return !value || std::atoi(value) != 0;
+    }();
+    const int cc_indexed = ggml_cuda_info().devices[ctx.device].cc;
+    if (indexed_rows && ids && !fusion && src0->type == GGML_TYPE_Q3_K &&
+            GGML_CUDA_CC_IS_RDNA4(cc_indexed) && ne01 == 1 && ne03 == 1 &&
+            ne11 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(ids) && ggml_is_contiguous(dst) &&
+            ne00 <= INT32_MAX && s02 > 0 && ne02 <= INT32_MAX/s02 && ne1 <= INT32_MAX) {
+        constexpr auto type = GGML_TYPE_Q3_K;
+        const int nw = calc_nwarps(type, 1, MMVQ_PARAMETERS_RDNA4);
+        const int nr = calc_rows_per_block(1, MMVQ_PARAMETERS_RDNA4, false, nw);
+        mul_mat_vec_q_indexed_rows<type><<<dim3((ne1 + nr - 1)/nr), dim3(32, nw), 0, stream>>>(
+            src0->data, reinterpret_cast<const block_q8_1 *>(src1_q8_1), ids_d, dst_d,
+            int(ne00), int(ne02), int(ne1), int(s02));
+        return;
+    }
+#endif
 
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,

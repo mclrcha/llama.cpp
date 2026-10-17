@@ -2,6 +2,9 @@
 
 #include "../tools/server/server-common.h"
 #include "../tools/server/server-decision.h"
+#include "../common/speculative-vocab.h"
+#include "../src/llama-cparams.h"
+#include "../src/llama-graph.h"
 
 #include <cstdlib>
 #include <regex>
@@ -435,6 +438,90 @@ static void test_decision_escape(testing & t) {
     });
 }
 
+static void test_checkpoint_retention(testing & t) {
+    std::list<common_prompt_checkpoint> checkpoints;
+    t.assert_true("empty", server_checkpoint_victim(checkpoints) == checkpoints.end());
+    for (int64_t n : {4096, 8192, 8448, 16384}) {
+        checkpoints.emplace_back();
+        checkpoints.back().n_tokens = n;
+    }
+    checkpoints.front().reuse_count = 4;
+    auto victim = server_checkpoint_victim(checkpoints);
+    t.assert_equal("drop redundant boundary", int64_t(8448), victim->n_tokens);
+    checkpoints.erase(victim);
+    t.assert_equal("preserve reused branch", int64_t(4096), checkpoints.front().n_tokens);
+    t.assert_equal("preserve longest prefix", int64_t(16384), checkpoints.back().n_tokens);
+    checkpoints.resize(1);
+    t.assert_true("single", server_checkpoint_victim(checkpoints) == checkpoints.begin());
+}
+
+static void test_dynamic_draft_vocab(testing & t) {
+    common_speculative_vocab vocab;
+    vocab.configure(100000, 64);
+    for (int i = 0; i < 4000; ++i) {
+        vocab.observe(90000 + i%10);
+    }
+    vocab.observe(-1);
+    vocab.observe(100000);
+    t.assert_equal("bounded history", size_t(3072), vocab.recent.size());
+    const int32_t priority[] = {99999, 99999, -1, 100000};
+    auto ids = vocab.select(priority, 4);
+    t.assert_equal("fixed shape", size_t(64), ids.size());
+    t.assert_true("sorted unique", std::adjacent_find(ids.begin(), ids.end(), std::greater_equal<int32_t>()) == ids.end());
+    t.assert_true("retain target candidate", std::binary_search(ids.begin(), ids.end(), 99999));
+    t.assert_true("retain recent rare token", std::binary_search(ids.begin(), ids.end(), 90009));
+    t.assert_true("retain low-ID prefix", std::binary_search(ids.begin(), ids.end(), 31));
+    t.assert_true("deterministic", ids == vocab.select(priority, 4));
+    vocab.configure(100000, 100000);
+    t.assert_true("invalid capacity disables", vocab.select(nullptr, 0).empty());
+}
+
+static void test_graph_reuse_sampler_sequences(testing & t) {
+    std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)> sampler(
+            llama_sampler_init_greedy(), llama_sampler_free);
+    const auto make_params = [&](const std::vector<std::vector<llama_seq_id>> & seqs) {
+        llm_graph_params params{};
+        auto data = std::make_shared<llama_ubatch::data_t>();
+        data->token = {0, 0};
+        data->output = {1, 0};
+        data->seq_id_unq = {0, 1, 2};
+        for (const auto & seq : seqs) {
+            data->n_seq_id.push_back(seq.size());
+            data->seq_id_data.insert(data->seq_id_data.end(), seq.begin(), seq.end());
+        }
+        size_t offset = 0;
+        for (const auto & seq : seqs) {
+            data->seq_id.push_back(data->seq_id_data.data() + offset);
+            offset += seq.size();
+        }
+        auto & ubatch = params.ubatch;
+        ubatch.n_tokens = 2;
+        ubatch.n_seq_tokens = 1;
+        ubatch.n_seqs = 2;
+        ubatch.n_seqs_unq = 3;
+        ubatch.token = data->token.data();
+        ubatch.output = data->output.data();
+        ubatch.n_seq_id = data->n_seq_id.data();
+        ubatch.seq_id = data->seq_id.data();
+        ubatch.seq_id_unq = data->seq_id_unq.data();
+        ubatch.data = std::move(data);
+        params.n_outputs = 1;
+        params.samplers = {{0, sampler.get()}, {1, sampler.get()}};
+        return params;
+    };
+
+    const auto before = make_params({{0, 1}, {0, 2}});
+    const auto same = make_params({{0, 1}, {0, 2}});
+    // The output now also belongs to sequence 2, which needs a full host logits row.
+    // Counts, unique IDs and each token's first sequence ID remain unchanged.
+    const auto changed = make_params({{0, 2}, {0, 1}});
+    const auto fewer = make_params({{0}, {0, 1, 2}});
+    t.assert_true("same sampler sequences reuse", before.allow_reuse(same));
+    t.assert_true("secondary output sequence changes topology", !before.allow_reuse(changed));
+    t.assert_true("sequence count changes topology", !before.allow_reuse(fewer));
+    t.assert_true("sequence count growth changes topology", !fewer.allow_reuse(before));
+}
+
 int main(int argc, char ** argv) {
     testing t;
 
@@ -454,6 +541,9 @@ int main(int argc, char ** argv) {
     t.test("lora_helpers",  test_lora_helpers);
     t.test("server_pipe",   test_server_pipe);
     t.test("decision_escape", test_decision_escape);
+    t.test("checkpoint_retention", test_checkpoint_retention);
+    t.test("dynamic_draft_vocab", test_dynamic_draft_vocab);
+    t.test("graph_reuse_sampler_sequences", test_graph_reuse_sampler_sequences);
 
     return t.summary();
 }

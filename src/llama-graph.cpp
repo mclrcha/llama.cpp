@@ -1415,6 +1415,16 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_draft_candidates::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    GGML_ASSERT(ids && ids->size() == size_t(ggml_nelements(tensor)));
+    ggml_backend_tensor_set(tensor, ids->data(), 0, ids->size()*sizeof(int32_t));
+}
+
+bool llm_graph_input_draft_candidates::can_reuse(const llm_graph_params & params) {
+    return ids == params.draft_candidates && params.n_draft_candidates == size_t(ggml_nelements(tensor));
+}
+
 bool llm_graph_input_sampling::can_reuse(const llm_graph_params & params) {
     if (samplers.size() != params.samplers.size()) {
         return false;
@@ -1448,6 +1458,7 @@ void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
     t_logits      = nullptr;
+    t_draft_candidates = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
@@ -1629,6 +1640,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
+    draft_candidates (params.draft_candidates),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1667,18 +1679,39 @@ ggml_tensor * llm_graph_context::build_draft_lm_head(
             cur->ne[2] != 1 || cur->ne[3] != 1) {
         return build_lora_mm(w, cur, w_s);
     }
-    cur = build_hadamard_input(w, cur);
-    ggml_tensor * w_sub  = w_draft && w_draft->ne[0] == w->ne[0] && w_draft->ne[1] == draft_vocab ? w_draft :
-        ggml_view_2d(ctx0, w, w->ne[0], draft_vocab, w->nb[1], 0);
-    ggml_tensor * logits = ggml_mul_mat(ctx0, w_sub, cur);
-
-    // Backend samplers only see the scored rows: the -inf rest never enters a top-k and adds 0 to a softmax, and the
-    // host never reads raw logits. Skips building and copying the -inf block (LLAMA_MTP_DRAFT_FULL_ROW=1 keeps it).
     static const bool full_row = [] {
         const char * value = getenv("LLAMA_MTP_DRAFT_FULL_ROW");
         return value && std::atoi(value) != 0;
     }();
-    if (!full_row && !samplers.empty()) {
+    bool backend_only = !samplers.empty();
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        if (!ubatch.output[i]) {
+            continue;
+        }
+        for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+            backend_only &= samplers.find(ubatch.seq_id[i][j]) != samplers.end();
+        }
+    }
+    cur = build_hadamard_input(w, cur);
+    ggml_tensor * w_sub  = w_draft && w_draft->ne[0] == w->ne[0] && w_draft->ne[1] == draft_vocab ? w_draft :
+        ggml_view_2d(ctx0, w, w->ne[0], draft_vocab, w->nb[1], 0);
+    if (draft_candidates && draft_candidates->size() >= 16 && w_sub == w_draft &&
+            w_sub->type == GGML_TYPE_Q3_K && cur->ne[1] == 1 && ubatch.n_seqs_unq == 1 && backend_only && !full_row) {
+        auto inp = std::make_unique<llm_graph_input_draft_candidates>(draft_candidates);
+        inp->tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, draft_candidates->size());
+        ggml_set_name(inp->tensor, "mtp_draft_candidates");
+        ggml_set_input(inp->tensor);
+        res->t_draft_candidates = inp->tensor;
+        auto * weights = ggml_reshape_3d(ctx0, w_sub, w_sub->ne[0], 1, w_sub->ne[1]);
+        auto * selected = ggml_mul_mat_id(ctx0, weights, cur, inp->tensor);
+        res->add_input(std::move(inp));
+        return ggml_reshape_2d(ctx0, selected, draft_candidates->size(), 1);
+    }
+    ggml_tensor * logits = ggml_mul_mat(ctx0, w_sub, cur);
+
+    // Backend samplers only see the scored rows: the -inf rest never enters a top-k and adds 0 to a softmax, and the
+    // host never reads raw logits. Skips building and copying the -inf block (LLAMA_MTP_DRAFT_FULL_ROW=1 keeps it).
+    if (!full_row && backend_only) {
         return logits;
     }
 
@@ -4309,7 +4342,7 @@ void llm_graph_context::build_sampling() const {
                 /*.logits       =*/ logits_seq,
                 /*.probs        =*/ nullptr,
                 /*.sampled      =*/ nullptr,
-                /*.candidates   =*/ nullptr,
+                /*.candidates   =*/ res->t_draft_candidates,
             };
 
             assert(sampler->iface->backend_apply);

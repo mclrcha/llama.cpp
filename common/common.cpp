@@ -2391,6 +2391,7 @@ bool common_prompt_checkpoint::empty() const {
 
 void common_prompt_checkpoint::clear() {
     n_tokens = 0;
+    reuse_count = 0;
 
     pos_min = 0;
     pos_max = 0;

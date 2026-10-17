@@ -16,12 +16,16 @@
 #include <cinttypes>
 #include <cstdio>
 #include <functional>
+#include <list>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <vector>
 
 using json = common_json;
+
+// Keep useful branch points while retaining the chronological checkpoint order.
+std::list<common_prompt_checkpoint>::iterator server_checkpoint_victim(std::list<common_prompt_checkpoint> & checkpoints);
 
 #define SLT_DBG(slot, fmt, ...) LOG_DBG("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)
 #define SLT_TRC(slot, fmt, ...) LOG_TRC("slot %12.*s: id %2d | task %d | " fmt, 12, __func__, (slot).id, ((slot).task ? (slot).task->id : -1), __VA_ARGS__)

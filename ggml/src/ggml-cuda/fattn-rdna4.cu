@@ -29,12 +29,18 @@ constexpr int smem(const int nwarps) { return K_BYTES + VT_BYTES + nwarps*16*16*
 constexpr int KV_MAX_STEP = 256;
 }
 
+static int fattn_r4_env(const char * name, const int fallback) {
+    const char * value = getenv(name);
+    return value ? std::atoi(value) : fallback;
+}
+
 #if defined(GGML_USE_HIP) && defined(RDNA4)
 #define FATTN_RDNA4_AVAILABLE
 #endif
 
 typedef _Float16 fattn_r4_half8  __attribute__((ext_vector_type(8)));
 typedef float    fattn_r4_float8 __attribute__((ext_vector_type(8)));
+typedef int16_t  fattn_r4_short8 __attribute__((ext_vector_type(8)));
 
 #ifdef FATTN_RDNA4_AVAILABLE
 // Barrier for SRAM only: __syncthreads also invalidates the vector L0 cache (acquire at workgroup scope in WGP mode).
@@ -47,6 +53,26 @@ static __device__ __forceinline__ void fattn_r4_lds_barrier() {
 // Value of lane l ^ 16.
 static __device__ __forceinline__ float fattn_r4_xor16(const float x) {
     return __int_as_float(__builtin_amdgcn_permlanex16(__float_as_int(x), __float_as_int(x), 0x76543210, 0xfedcba98, false, false));
+}
+
+template <bool compact>
+static __device__ __forceinline__ int fattn_r4_k_offset(const int row, const int col) {
+    return compact ? row*fattn_r4::D + (((col >> 3) ^ (row & 31)) << 3) + (col & 7) : row*fattn_r4::K_STRIDE + col;
+}
+
+template <bool compact>
+static __device__ __forceinline__ int fattn_r4_v_offset(const int row, const int col) {
+    return compact ? row*fattn_r4::BC + (((col >> 3) ^ (row & 3)) << 3) + (col & 7) : row*fattn_r4::VT_STRIDE + col;
+}
+
+// A pair can finish softmax while another pair is still computing QK.
+static __device__ __forceinline__ void fattn_r4_pair_barrier(unsigned * flags, const int wave, const int lane, const unsigned generation) {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    if (lane == 0) {
+        atomicExch(flags + wave, generation);
+        while (atomicAdd(flags + (wave ^ 1), 0u) != generation) {}
+    }
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
 }
 #endif // FATTN_RDNA4_AVAILABLE
 
@@ -103,7 +129,7 @@ static __device__ __forceinline__ void fattn_r4d_dequant8(const int2 q, const ha
     v[3] = __hmul2(make_half2(b.z, b.w), d2);
 }
 
-template <int NW, bool use_mask, bool q8>
+template <int NW, bool use_mask, bool q8, int V_MODE = 0, bool reuse_lds = false, bool wave_phases = false>
 __launch_bounds__(NW*WARP_SIZE, 1)
 static __global__ void fattn_rdna4_d256(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
@@ -112,7 +138,7 @@ static __global__ void fattn_rdna4_d256(
         const int nb01, const int nb02, const int64_t nb03,
         const int nb11, const int nb12, const int64_t nb13,
         const int nb21, const int nb22, const int64_t nb23,
-        const int nb31, const int64_t nb33, const int hp_log2) {
+        const int nb31, const int64_t nb33, const int hp_log2, const int grid_mode) {
 #ifdef FATTN_RDNA4_AVAILABLE
     using namespace fattn_r4;
     typedef fattn_r4_half8  half8;
@@ -130,8 +156,12 @@ static __global__ void fattn_rdna4_d256(
     const int rgh  = (NW/2) >> hp_log2;
     const int hb   = rg / rgh;
     const int rt   = rg - hb*rgh;
-    const int tile = blockIdx.x;
-    const int head = (blockIdx.y << hp_log2) + hb;
+    const int groups = gqa_ratio >> hp_log2;
+    const uint64_t linear = uint64_t(blockIdx.y)*gridDim.x + blockIdx.x;
+    const int head_block = grid_mode == 2 ? int((linear/(uint64_t(gridDim.x)*groups))*groups + linear%groups) : int(blockIdx.y);
+    const int tile_asc = grid_mode == 2 ? int((linear/groups)%gridDim.x) : int(blockIdx.x);
+    const int tile = grid_mode ? int(gridDim.x) - 1 - tile_asc : tile_asc;
+    const int head = (head_block << hp_log2) + hb;
     const int seq  = blockIdx.z;
     const int kvh  = head / gqa_ratio;
     const int tq   = tile*16*rgh + rt*16 + lq;   // token of the Q/S/O column held by this lane
@@ -139,8 +169,15 @@ static __global__ void fattn_rdna4_d256(
 
     extern __shared__ __align__(16) char fattn_r4_smem[];
     half  * sK  = (half  *)  fattn_r4_smem;
-    half  * sVT = (half  *) (fattn_r4_smem + K_BYTES);
-    float * sS  = (float *) (fattn_r4_smem + K_BYTES + VT_BYTES);
+    half  * sVT = (half  *) (fattn_r4_smem + (reuse_lds ? 0 : K_BYTES));
+    float * sS  = (float *) (fattn_r4_smem + (reuse_lds ? BC*D*2 : K_BYTES + VT_BYTES));
+    unsigned * pair_flags = (unsigned *) (sS + NW*256);
+    if constexpr (wave_phases) {
+        if (lane == 0) {
+            pair_flags[w] = 0;
+        }
+        fattn_r4_lds_barrier();
+    }
 
     // Q^T as B operand: lane holds token tq, head dims [16 k + 8 h, 16 k + 8 h + 8).
     half8 qb[D/16];
@@ -221,12 +258,29 @@ static __global__ void fattn_rdna4_d256(
             st.k2 = *(const int4 *) (k0 + 16*int64_t(nb11));
             st.k3 = *(const int4 *) (k0 + 24*int64_t(nb11));
         }
-        const char * v0 = Vh + int64_t(kv0 + 2*lq)*nb21;
-        st.v0 = *(const int4 *) (v0        + vcA*16);
-        st.v1 = *(const int4 *) (v0 + nb21 + vcA*16);
-        if constexpr (NW == 8) {
-            st.v2 = *(const int4 *) (v0        + vcB*16);
-            st.v3 = *(const int4 *) (v0 + nb21 + vcB*16);
+        if constexpr (V_MODE == 1) {
+            int4 * vv[4] = {&st.v0, &st.v1, &st.v2, &st.v3};
+#pragma unroll
+            for (int i = 0; i < 32/NW; ++i) {
+                *vv[i] = *(const int4 *) (Vh + int64_t(kv0)*D*2 + (tid + i*NW*WARP_SIZE)*16);
+            }
+        } else if constexpr (V_MODE == 2) {
+            int4 * vv[4] = {&st.v0, &st.v1, &st.v2, &st.v3};
+#pragma unroll
+            for (int i = 0; i < 32/NW; ++i) {
+                const int subtile = w*(32/NW) + i;
+                const char * vp = Vh + int64_t(kv0 + 8*(subtile/8) + lane/4)*nb21 + (32*(subtile%8) + 8*(lane%4))*2;
+                const fattn_r4_short8 v = __builtin_amdgcn_global_load_tr_b128_v8i16((fattn_r4_short8 *) vp);
+                *vv[i] = *(const int4 *) &v;
+            }
+        } else {
+            const char * v0 = Vh + int64_t(kv0 + 2*lq)*nb21;
+            st.v0 = *(const int4 *) (v0        + vcA*16);
+            st.v1 = *(const int4 *) (v0 + nb21 + vcA*16);
+            if constexpr (NW == 8) {
+                st.v2 = *(const int4 *) (v0        + vcB*16);
+                st.v3 = *(const int4 *) (v0 + nb21 + vcB*16);
+            }
         }
     };
 
@@ -240,6 +294,47 @@ static __global__ void fattn_rdna4_d256(
     }
     float m = -1e30f;
     float l = 0.0f;
+
+    auto store_v = [&](const stage & st) {
+        if constexpr (V_MODE == 1) {
+            const int4 vv[4] = {st.v0, st.v1, st.v2, st.v3};
+#pragma unroll
+            for (int i = 0; i < 32/NW; ++i) {
+                const int chunk = tid + i*NW*WARP_SIZE;
+                *(int4 *) (sVT + fattn_r4_v_offset<reuse_lds>(chunk/4, 8*(chunk%4))) = vv[i];
+            }
+        } else if constexpr (V_MODE == 2) {
+            const int4 vv[4] = {st.v0, st.v1, st.v2, st.v3};
+#pragma unroll
+            for (int i = 0; i < 32/NW; ++i) {
+                const int subtile = w*(32/NW) + i;
+                const uint16_t * v = (const uint16_t *) &vv[i];
+#pragma unroll
+                for (int e = 0; e < 4; ++e) {
+                    const int dim = 32*(subtile%8) + 8*e + lane%8;
+                    const int row = 8*(subtile/8) + 2*(lane/8);
+                    *(uint32_t *) (sVT + fattn_r4_v_offset<reuse_lds>(dim, row)) = uint32_t(v[e]) | (uint32_t(v[e + 4]) << 16);
+                }
+            }
+        } else {
+            const uint32_t a0[4] = {uint32_t(st.v0.x), uint32_t(st.v0.y), uint32_t(st.v0.z), uint32_t(st.v0.w)};
+            const uint32_t a1[4] = {uint32_t(st.v1.x), uint32_t(st.v1.y), uint32_t(st.v1.z), uint32_t(st.v1.w)};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                *(uint32_t *) (sVT + fattn_r4_v_offset<reuse_lds>(8*vcA + 2*j,     2*lq)) = (a0[j] & 0xFFFFu) | (a1[j] << 16);
+                *(uint32_t *) (sVT + fattn_r4_v_offset<reuse_lds>(8*vcA + 2*j + 1, 2*lq)) = (a0[j] >> 16) | (a1[j] & 0xFFFF0000u);
+            }
+            if constexpr (NW == 8) {
+                const uint32_t b0[4] = {uint32_t(st.v2.x), uint32_t(st.v2.y), uint32_t(st.v2.z), uint32_t(st.v2.w)};
+                const uint32_t b1[4] = {uint32_t(st.v3.x), uint32_t(st.v3.y), uint32_t(st.v3.z), uint32_t(st.v3.w)};
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    *(uint32_t *) (sVT + fattn_r4_v_offset<reuse_lds>(8*vcB + 2*j,     2*lq)) = (b0[j] & 0xFFFFu) | (b1[j] << 16);
+                    *(uint32_t *) (sVT + fattn_r4_v_offset<reuse_lds>(8*vcB + 2*j + 1, 2*lq)) = (b0[j] >> 16) | (b1[j] & 0xFFFF0000u);
+                }
+            }
+        }
+    };
 
     auto step = [&](stage & st, const int kv0, auto with_mask) {
         constexpr bool M = decltype(with_mask)::value;
@@ -255,38 +350,23 @@ static __global__ void fattn_rdna4_d256(
             }
         }
         {
-            half * k0 = sK + krow*K_STRIDE + kcol*8;
-            *(int4 *) (k0)               = st.k0;
-            *(int4 *) (k0 + NW*K_STRIDE) = st.k1;
+            *(int4 *) (sK + fattn_r4_k_offset<reuse_lds>(krow, kcol*8)) = st.k0;
+            *(int4 *) (sK + fattn_r4_k_offset<reuse_lds>(krow + NW, kcol*8)) = st.k1;
             if constexpr (NW == 8) {
-                *(int4 *) (k0 + 16*K_STRIDE) = st.k2;
-                *(int4 *) (k0 + 24*K_STRIDE) = st.k3;
+                *(int4 *) (sK + fattn_r4_k_offset<reuse_lds>(krow + 16, kcol*8)) = st.k2;
+                *(int4 *) (sK + fattn_r4_k_offset<reuse_lds>(krow + 24, kcol*8)) = st.k3;
             }
         }
-        {
-            // Head dim i of rows 2 lq and 2 lq + 1 packed as one 32 bit word.
-            const uint32_t a0[4] = {uint32_t(st.v0.x), uint32_t(st.v0.y), uint32_t(st.v0.z), uint32_t(st.v0.w)};
-            const uint32_t a1[4] = {uint32_t(st.v1.x), uint32_t(st.v1.y), uint32_t(st.v1.z), uint32_t(st.v1.w)};
-#pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                *(uint32_t *) (sVT + (8*vcA + 2*j    )*VT_STRIDE + 2*lq) = (a0[j] & 0xFFFFu) | (a1[j] << 16);
-                *(uint32_t *) (sVT + (8*vcA + 2*j + 1)*VT_STRIDE + 2*lq) = (a0[j] >> 16)     | (a1[j] & 0xFFFF0000u);
-            }
-            if constexpr (NW == 8) {
-                const uint32_t b0[4] = {uint32_t(st.v2.x), uint32_t(st.v2.y), uint32_t(st.v2.z), uint32_t(st.v2.w)};
-                const uint32_t b1[4] = {uint32_t(st.v3.x), uint32_t(st.v3.y), uint32_t(st.v3.z), uint32_t(st.v3.w)};
-#pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    *(uint32_t *) (sVT + (8*vcB + 2*j    )*VT_STRIDE + 2*lq) = (b0[j] & 0xFFFFu) | (b1[j] << 16);
-                    *(uint32_t *) (sVT + (8*vcB + 2*j + 1)*VT_STRIDE + 2*lq) = (b0[j] >> 16)     | (b1[j] & 0xFFFF0000u);
-                }
-            }
+        if constexpr (!reuse_lds) {
+            store_v(st);
         }
         fattn_r4_lds_barrier();
 
         const int4 mcur = st.m;
-        if (kv0 + BC < kv_end) {
-            load_tile(st, kv0 + BC, with_mask);
+        if constexpr (!reuse_lds) {
+            if ((!wave_phases || w >= NW/2) && kv0 + BC < kv_end) {
+                load_tile(st, kv0 + BC, with_mask);
+            }
         }
 
         // S^T for KV rows [16 c, 16 c + 16): lane holds token tq, KV rows 16 c + 8 h + i.
@@ -300,16 +380,15 @@ static __global__ void fattn_rdna4_d256(
         }
         {
             // SRAM reads one pair of head dim blocks ahead of the WMMAs.
-            const half * kr = sK + (16*c + lq)*K_STRIDE + 8*h;
-            half8 a0n = *(const half8 *) (kr);
-            half8 a1n = *(const half8 *) (kr + 16);
+            half8 a0n = *(const half8 *) (sK + fattn_r4_k_offset<reuse_lds>(16*c + lq, 8*h));
+            half8 a1n = *(const half8 *) (sK + fattn_r4_k_offset<reuse_lds>(16*c + lq, 16 + 8*h));
 #pragma unroll
             for (int k = 0; k < D/16; k += 2) {
                 const half8 a0 = a0n;
                 const half8 a1 = a1n;
                 if (k + 2 < D/16) {
-                    a0n = *(const half8 *) (kr + 16*k + 32);
-                    a1n = *(const half8 *) (kr + 16*k + 48);
+                    a0n = *(const half8 *) (sK + fattn_r4_k_offset<reuse_lds>(16*c + lq, 16*k + 32 + 8*h));
+                    a1n = *(const half8 *) (sK + fattn_r4_k_offset<reuse_lds>(16*c + lq, 16*k + 48 + 8*h));
                 }
                 s  = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, qb[k],     s);
                 s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, qb[k + 1], s1);
@@ -326,6 +405,15 @@ static __global__ void fattn_rdna4_d256(
         for (int i = 0; i < 8; ++i) {
             s[i] += s1[i];
         }
+        if constexpr (reuse_lds) {
+            fattn_r4_lds_barrier();
+            store_v(st);
+        }
+        if constexpr (reuse_lds || wave_phases) {
+            if ((reuse_lds || w < NW/2) && kv0 + BC < kv_end) {
+                load_tile(st, kv0 + BC, with_mask);
+            }
+        }
         if constexpr (M) {
             const half8 mk = *(const half8 *) &mcur;
 #pragma unroll
@@ -337,7 +425,11 @@ static __global__ void fattn_rdna4_d256(
         float * sSw = sS + w*256;
         *(float4 *) (sSw +      4*lane) = make_float4(s[0], s[1], s[2], s[3]);
         *(float4 *) (sSw + 128 + 4*lane) = make_float4(s[4], s[5], s[6], s[7]);
-        fattn_r4_lds_barrier();
+        if constexpr (wave_phases) {
+            fattn_r4_pair_barrier(pair_flags, w, lane, unsigned(kv0/BC + 1));
+        } else {
+            fattn_r4_lds_barrier();
+        }
         float8 sp;
         {
             const float * sSp = sS + (w ^ 1)*256;
@@ -393,16 +485,15 @@ static __global__ void fattn_rdna4_d256(
         }
         {
             // SRAM reads of V^T one head dim tile ahead of the WMMAs.
-            const half * vt = sVT + (128*c + lq)*VT_STRIDE + 8*h;
-            half8 a0n = *(const half8 *) (vt);
-            half8 a1n = *(const half8 *) (vt + 16);
+            half8 a0n = *(const half8 *) (sVT + fattn_r4_v_offset<reuse_lds>(128*c + lq, 8*h));
+            half8 a1n = *(const half8 *) (sVT + fattn_r4_v_offset<reuse_lds>(128*c + lq, 16 + 8*h));
 #pragma unroll
             for (int dt = 0; dt < 8; ++dt) {
                 const half8 a0 = a0n;
                 const half8 a1 = a1n;
                 if (dt + 1 < 8) {
-                    a0n = *(const half8 *) (vt + 16*(dt + 1)*VT_STRIDE);
-                    a1n = *(const half8 *) (vt + 16*(dt + 1)*VT_STRIDE + 16);
+                    a0n = *(const half8 *) (sVT + fattn_r4_v_offset<reuse_lds>(128*c + lq + 16*(dt + 1), 8*h));
+                    a1n = *(const half8 *) (sVT + fattn_r4_v_offset<reuse_lds>(128*c + lq + 16*(dt + 1), 16 + 8*h));
                 }
                 O[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, O[dt]);
                 O[dt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, O[dt]);
@@ -460,7 +551,7 @@ static __global__ void fattn_rdna4_d256(
     }
 #else
     GGML_UNUSED_VARS(Q, K, V, mask, KV_bounds, dst, scale_log2, ne01, ne02, ne11, gqa_ratio, nb01, nb02, nb03,
-        nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, hp_log2);
+        nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, hp_log2, grid_mode);
     NO_DEVICE_CODE;
 #endif // FATTN_RDNA4_AVAILABLE
 }
@@ -577,6 +668,37 @@ static const char * fattn_rdna4_to_f16(const ggml_tensor * T, half * T_f16, size
     return (const char *) T_f16;
 }
 
+// Convert each 32x32 q8 tile directly into the existing F16 scratch in V-transposed order.
+static __global__ void fattn_rdna4_v_to_f16_transposed(
+        const char * __restrict__ src, half * __restrict__ dst, const int nkv, const int nheads,
+        const size_t nb1, const size_t nb2, const size_t nb3) {
+    __shared__ half tile[32][33];
+    const int row = threadIdx.x/4;
+    const int col = 8*(threadIdx.x%4);
+    const int kv0 = 32*blockIdx.x;
+    const int dim0 = 32*blockIdx.y;
+    const int head = blockIdx.z%nheads;
+    const int seq = blockIdx.z/nheads;
+    const char * b = src + seq*nb3 + head*nb2 + (kv0 + row)*nb1 + blockIdx.y*sizeof(block_q8_0);
+    half2 values[4];
+    fattn_r4d_dequant8(*(const int2 *) (b + sizeof(half) + col), *(const half *) b, values);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        tile[row][col + 2*i] = __low2half(values[i]);
+        tile[row][col + 2*i + 1] = __high2half(values[i]);
+    }
+    __syncthreads();
+    const int od = threadIdx.x/4;
+    const int ok = 8*(threadIdx.x%4);
+    fattn_r4_half8 out;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        out[i] = (_Float16) tile[ok + i][od];
+    }
+    const size_t offset = (size_t(seq)*nheads + head)*nkv*fattn_r4::D + size_t(kv0)*fattn_r4::D + (dim0 + od)*32 + ok;
+    *(int4 *) (dst + offset) = *(const int4 *) &out;
+}
+
 void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
@@ -587,6 +709,13 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
 
     const bool V_is_K_view = V->view_src && (V->view_src == K || (V->view_src == K->view_src && V->view_offs == K->view_offs));
     const bool q8 = ggml_cuda_flash_attn_ext_rdna4_reads_q8(ctx.device, dst);
+    static const int nw = fattn_r4_env("GGML_HIP_FA_R4_NW", 16) == 8 ? 8 : 16;
+    static const int requested_variant = fattn_r4_env("GGML_HIP_FA_R4_VARIANT", 0);
+    static const int grid_mode = std::max(0, std::min(2, fattn_r4_env("GGML_HIP_FA_R4_GRID", 0)));
+    int variant = !q8 && nw == 16 && requested_variant >= 1 && requested_variant <= 4 ? requested_variant : 0;
+    if (variant == 1 && (V->type != GGML_TYPE_Q8_0 || V_is_K_view || V->nb[0] != sizeof(block_q8_0) || V->ne[2] > 65535/V->ne[3])) {
+        variant = 0;
+    }
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra = ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, !q8, !q8);
 
     const char * K_data = (const char *) K->data;
@@ -601,6 +730,15 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
         if (V_is_K_view) {
             V_data = K_data;
             nb21 = nb11; nb22 = nb12; nb23 = nb13;
+        } else if (variant == 1) {
+            GGML_ASSERT(f16_extra.V != 0);
+            fattn_rdna4_v_to_f16_transposed<<<dim3(V->ne[1]/32, fattn_r4::D/32, V->ne[2]*V->ne[3]), 128, 0, stream>>>(
+                    (const char *) V->data, (half *) f16_extra.V, V->ne[1], V->ne[2], V->nb[1], V->nb[2], V->nb[3]);
+            CUDA_CHECK(cudaGetLastError());
+            V_data = (const char *) f16_extra.V;
+            nb21 = fattn_r4::D*sizeof(half);
+            nb22 = V->ne[1]*nb21;
+            nb23 = V->ne[2]*nb22;
         } else {
             GGML_ASSERT(f16_extra.V != 0);
             V_data = fattn_rdna4_to_f16(V, (half *) f16_extra.V, nb21, nb22, nb23, stream);
@@ -615,7 +753,6 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
     const int ne03   = Q->ne[3];
     const int ne11   = K->ne[1];
     // 16 waves (128 tokens) per block halve the K/V traffic per FLOP; GGML_HIP_FA_R4_NW=8 selects 64 tokens.
-    static const int nw = [] { const char * e = getenv("GGML_HIP_FA_R4_NW"); return e && std::atoi(e) == 8 ? 8 : 16; }();
     // Q heads per block: the largest power of 2 that divides the GQA ratio and fits the nw/2 row groups, so that each
     // K/V tile loaded into SRAM serves several heads (GGML_HIP_FA_R4_HP=1 keeps one head per block)
     static const int hp_max = [] { const char * e = getenv("GGML_HIP_FA_R4_HP"); return e ? std::max(1, std::atoi(e)) : 64; }();
@@ -660,11 +797,25 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
     const dim3 block(WARP_SIZE, nw);
     const float scale_log2 = scale*1.4426950408889634f;
     const int gqa_ratio = ne02 / K->ne[2];
-#define FATTN_R4_LAUNCH(NW, M) (q8 ? fattn_rdna4_d256<NW, M, true> : fattn_rdna4_d256<NW, M, false>)<<<grid, block, fattn_r4::smem(NW), stream>>>( \
+#define FATTN_R4_ARGS \
             (const char *) Q->data, K_data, V_data, mask ? (const char *) mask->data : nullptr, KV_bounds, (float *) dst->data, \
             scale_log2, ne01, ne02, ne11, gqa_ratio, Q->nb[1], Q->nb[2], Q->nb[3], \
-            nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, hp_log2)
-    if (nw == 16) {
+            nb11, nb12, nb13, nb21, nb22, nb23, nb31, nb33, hp_log2, grid_mode
+#define FATTN_R4_LAUNCH(NW, M) (q8 ? fattn_rdna4_d256<NW, M, true> : fattn_rdna4_d256<NW, M, false>)<<<grid, block, fattn_r4::smem(NW), stream>>>(FATTN_R4_ARGS)
+#define FATTN_R4_EXPERIMENT(M, V, R, P) fattn_rdna4_d256<16, M, false, V, R, P><<<grid, block, (R ? 32768 : fattn_r4::smem(16)) + (P ? 16*sizeof(unsigned) : 0), stream>>>(FATTN_R4_ARGS)
+#define FATTN_R4_EXPERIMENT_MASK(V, R, P) do { \
+        if (mask) { FATTN_R4_EXPERIMENT(true, V, R, P); } \
+        else { FATTN_R4_EXPERIMENT(false, V, R, P); } \
+    } while (0)
+    if (variant == 1) {
+        FATTN_R4_EXPERIMENT_MASK(1, false, false);
+    } else if (variant == 2) {
+        FATTN_R4_EXPERIMENT_MASK(2, false, false);
+    } else if (variant == 3) {
+        FATTN_R4_EXPERIMENT_MASK(0, true, false);
+    } else if (variant == 4) {
+        FATTN_R4_EXPERIMENT_MASK(0, false, true);
+    } else if (nw == 16) {
         if (mask) {
             FATTN_R4_LAUNCH(16, true);
         } else {
@@ -678,6 +829,9 @@ void ggml_cuda_flash_attn_ext_rdna4(ggml_backend_cuda_context & ctx, ggml_tensor
         }
     }
 #undef FATTN_R4_LAUNCH
+#undef FATTN_R4_EXPERIMENT
+#undef FATTN_R4_EXPERIMENT_MASK
+#undef FATTN_R4_ARGS
     CUDA_CHECK(cudaGetLastError());
 }
 

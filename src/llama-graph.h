@@ -779,6 +779,15 @@ public:
     std::map<llama_seq_id, llama_sampler *> samplers;
 };
 
+class llm_graph_input_draft_candidates : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_draft_candidates(const std::vector<int32_t> * ids) : ids(ids) {}
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+    const std::vector<int32_t> * ids;
+    ggml_tensor * tensor = nullptr;
+};
+
 //
 // llm_graph_result
 //
@@ -816,6 +825,9 @@ struct llm_graph_params {
     const llama_prec_policy * prec_policy = nullptr;
 
     const llama_hadamard * hdmd = nullptr;
+
+    const std::vector<int32_t> * draft_candidates = nullptr;
+    size_t n_draft_candidates = 0;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -880,6 +892,10 @@ struct llm_graph_params {
             return false;
         }
 
+        if (n_draft_candidates != other.n_draft_candidates) {
+            return false;
+        }
+
         if (!samplers_equal(samplers, other.samplers)) {
             return false;
         }
@@ -891,9 +907,14 @@ struct llm_graph_params {
 
             // check that the outputs are the same for all samplers
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
-                if (ubatch.output[i]    != other.ubatch.output[i] ||
-                    ubatch.seq_id[i][0] != other.ubatch.seq_id[i][0]) {
+                if (ubatch.output[i]   != other.ubatch.output[i] ||
+                    ubatch.n_seq_id[i] != other.ubatch.n_seq_id[i]) {
                     return false;
+                }
+                for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+                    if (ubatch.seq_id[i][j] != other.ubatch.seq_id[i][j]) {
+                        return false;
+                    }
                 }
             }
         }
@@ -969,6 +990,7 @@ public:
     ggml_tensor * t_inp_tokens  = nullptr;
     ggml_tensor * t_inp_embd    = nullptr; // [n_embd_inp, n_tokens]
     ggml_tensor * t_logits      = nullptr;
+    ggml_tensor * t_draft_candidates = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
@@ -1071,6 +1093,7 @@ struct llm_graph_context {
     const llama_prec_policy * prec_policy;
 
     const llama_hadamard * hdmd;
+    const std::vector<int32_t> * draft_candidates;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 

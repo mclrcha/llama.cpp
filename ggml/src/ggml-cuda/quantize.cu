@@ -1,6 +1,7 @@
 #include "quantize.cuh"
 #include "convert.cuh"
 #include "unary.cuh"
+#include "mmdq-rdna4.cuh"
 #include <cstdint>
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
@@ -710,7 +711,8 @@ void quantize_mmq_fp4_cuda(
 // quantization follows quantize_mmq_q8_1, so the result is bit identical to the unfused path.
 template <mmq_q8_1_ds_layout ds_layout, bool f16 = false>
 static __global__ void quantize_mmq_norm_gate_128(const float * __restrict__ x, const float * __restrict__ w,
-        const float * __restrict__ g, void * __restrict__ vy, const float eps, const int nheads, const int ne1) {
+        const float * __restrict__ g, void * __restrict__ vy, const float eps, const int nheads, const int ne1,
+        const int f16_layout) {
     const int t    = blockIdx.x;
     const int h    = blockIdx.y*blockDim.y + threadIdx.y;
     const int lane = threadIdx.x;
@@ -772,7 +774,8 @@ static __global__ void quantize_mmq_norm_gate_128(const float * __restrict__ x, 
             // Match convert_f32_f16_sat, including NaNs and overflow saturation.
             out[c] = ggml_cuda_cast<half>(value > 65504.0f ? 65504.0f : (value < -65504.0f ? -65504.0f : value));
         }
-        half2 * y = (half2 *) vy + base/2;
+        const int64_t output = f16_layout ? ggml_cuda_mmdq_x_index(t, h*128 + 4*lane, nheads*128, f16_layout) : base;
+        half2 * y = (half2 *) vy + output/2;
         y[0] = make_half2(out[0], out[1]);
         y[1] = make_half2(out[2], out[3]);
         return;
@@ -814,11 +817,11 @@ static __global__ void quantize_mmq_norm_gate_128(const float * __restrict__ x, 
 }
 
 void ggml_cuda_norm_gate_f16(const float * x, const float * w, const float * g, float eps, half * dst,
-        int nheads, int n, cudaStream_t stream) {
+        int nheads, int n, cudaStream_t stream, int layout) {
     constexpr int heads_per_block = 4;
     const dim3 grid(n, (nheads + heads_per_block - 1)/heads_per_block);
     const dim3 block(WARP_SIZE, heads_per_block);
-    quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_D4, true><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n);
+    quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_D4, true><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n, layout);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -834,27 +837,28 @@ void quantize_mmq_norm_gate_cuda(const float * x, const float * w, const float *
     const dim3 block(WARP_SIZE, heads_per_block);
     switch (mmq_get_q8_1_ds_layout(type)) {
         case MMQ_Q8_1_DS_LAYOUT_D4:
-            quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n);
+            quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_D4><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n, 0);
             break;
         case MMQ_Q8_1_DS_LAYOUT_DS4:
-            quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n);
+            quantize_mmq_norm_gate_128<MMQ_Q8_1_DS_LAYOUT_DS4><<<grid, block, 0, stream>>>(x, w, g, dst, eps, nheads, n, 0);
             break;
         default:
             GGML_ABORT("unsupported MMQ layout");
     }
 }
 
-static __global__ void silu_f16(const float * gate, const float * up, half * dst, const int64_t n) {
+static __global__ void silu_f16(const float * gate, const float * up, half * dst, const int64_t n, int64_t k, int layout) {
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
     if (i < n) {
         const float value = ggml_cuda_op_silu_single(gate[i])*up[i];
-        dst[i] = ggml_cuda_cast<half>(value > 65504.0f ? 65504.0f : (value < -65504.0f ? -65504.0f : value));
+        const int64_t out = layout ? ggml_cuda_mmdq_x_index(i/k, i%k, k, layout) : i;
+        dst[out] = ggml_cuda_cast<half>(value > 65504.0f ? 65504.0f : (value < -65504.0f ? -65504.0f : value));
     }
 }
 
-void ggml_cuda_silu_f16(const float * gate, const float * up, half * dst, int64_t n, cudaStream_t stream) {
+void ggml_cuda_silu_f16(const float * gate, const float * up, half * dst, int64_t n, cudaStream_t stream, int64_t k, int layout) {
     const int block = 256;
-    silu_f16<<<(n + block - 1)/block, block, 0, stream>>>(gate, up, dst, n);
+    silu_f16<<<(n + block - 1)/block, block, 0, stream>>>(gate, up, dst, n, k, layout);
 }
 
 // silu(gate)*up quantized to the MMQ Q8_1 layout. Each thread handles nchunk groups of 4 values that are 512 apart and

@@ -1304,6 +1304,9 @@ using common_state_bytes = std::vector<uint8_t, common_state_allocator<uint8_t>>
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
+    // Retention hint only; not part of the serialized model state.
+    uint32_t reuse_count = 0;
+
     // (optional) id of the task that created the checkpoint
     int id_task = -1;
 

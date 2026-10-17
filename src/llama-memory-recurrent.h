@@ -4,6 +4,7 @@
 #include "llama-graph.h"
 #include "llama-memory.h"
 
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -78,6 +79,11 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    void set_gdn_flush_callback(std::function<void()> callback);
+    bool get_gdn_rollback(llama_seq_id seq_id, int & rollback) const;
+    // Call after the backend commits state and synchronizes its stream.
+    bool commit_gdn_rollback(llama_seq_id seq_id, int expected_idx);
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -122,6 +128,9 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    std::function<void()> gdn_flush_callback;
+    void flush_gdn() const;
 
     // true if no layers - can happen if the layer filter removes all layers
     bool is_empty() const;

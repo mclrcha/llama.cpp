@@ -874,7 +874,7 @@ static void launch_gated_delta_net(
             return !env || std::atoi(env) != 0;
         }();
         if constexpr (!KDA) {
-            if ((clustered || state_indices) && n_tokens >= 1 && n_tokens <= 4) {
+            if ((clustered || state_indices) && n_tokens >= 1 && n_tokens <= 8) {
                 const ggml_cuda_kernel_launch_params params(dim3(H, n_seqs, S_v / 8), dim3(8, 8, 1), 0, stream);
                 if (state_indices) {
                 ggml_cuda_kernel_launch(gated_delta_net_cuda<128, false, keep_rs_t, 8, 8, true>, params,

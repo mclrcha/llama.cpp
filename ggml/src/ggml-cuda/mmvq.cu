@@ -1605,6 +1605,7 @@ bool ggml_cuda_can_fuse_mixed_mmvq(const ggml_tensor * up, const ggml_tensor * g
     const auto supported = [](ggml_type type) {
         return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_IQ4_XS;
     };
+    // up to 4 tokens: from 6 on, one row per block loses to the two-row MMVQ plus the separate GLU
     return enabled && GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ggml_cuda_get_device()].cc) &&
         supported(up->type) && supported(gate->type) &&
         (up->type != gate->type || (enabled == 2 && src->ne[1] > 1)) &&
@@ -2020,7 +2021,7 @@ void ggml_cuda_mul_mat_vec_q(
     }
     // Eight rows per block need enough rows to keep the 64 CUs on R9700 occupied.
     if (GGML_CUDA_CC_IS_RDNA4(ggml_cuda_info().devices[ctx.device].cc) && src0->type == GGML_TYPE_Q8_0 &&
-            !ids && !fusion && ne11 >= 1 && ne11 <= 4 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
+            !ids && !fusion && ne11 >= 1 && ne11 <= 8 && ne12 == 1 && ne13 == 1 && ne02 == 1 && ne03 == 1 &&
             ne00 <= (ne11 == 1 ? 2048 : 8192) && ne01 >= 512 && ne01 <= 32768 && ggml_is_contiguous(src0) && ggml_is_contiguous(dst)) {
         static const bool batch_row1 = [] {
             const char * value = std::getenv("GGML_HIP_Q8_BATCH_ROW1");
@@ -2046,6 +2047,10 @@ void ggml_cuda_mul_mat_vec_q(
             case 2: launch(std::integral_constant<int, 2>{}); break;
             case 3: launch(std::integral_constant<int, 3>{}); break;
             case 4: launch(std::integral_constant<int, 4>{}); break;
+            case 5: launch(std::integral_constant<int, 5>{}); break;
+            case 6: launch(std::integral_constant<int, 6>{}); break;
+            case 7: launch(std::integral_constant<int, 7>{}); break;
+            case 8: launch(std::integral_constant<int, 8>{}); break;
         }
         return;
     }
@@ -2193,7 +2198,7 @@ void ggml_cuda_gdn_gates_q8(ggml_backend_cuda_context & ctx,
         const ggml_tensor * alpha, const ggml_tensor * beta, const ggml_tensor * input,
         const ggml_tensor * bias, const ggml_tensor * scale, float * output, float * beta_output) {
     const int tokens = input->ne[1];
-    GGML_ASSERT(input->ne[0] == 5120 && tokens >= 1 && tokens <= 4);
+    GGML_ASSERT(input->ne[0] == 5120 && tokens >= 1 && tokens <= 8);
     const size_t bytes = size_t(tokens)*160*sizeof(block_q8_1);
     ggml_cuda_pool_alloc<char> temporary(ctx.pool());
     auto & cache = ctx.mmvq_cache;
@@ -2218,6 +2223,10 @@ void ggml_cuda_gdn_gates_q8(ggml_backend_cuda_context & ctx,
         case 2: launch(std::integral_constant<int,2>{}); break;
         case 3: launch(std::integral_constant<int,3>{}); break;
         case 4: launch(std::integral_constant<int,4>{}); break;
+        case 5: launch(std::integral_constant<int,5>{}); break;
+        case 6: launch(std::integral_constant<int,6>{}); break;
+        case 7: launch(std::integral_constant<int,7>{}); break;
+        case 8: launch(std::integral_constant<int,8>{}); break;
         default: GGML_ABORT("unsupported Q8 GDN gate batch");
     }
 }

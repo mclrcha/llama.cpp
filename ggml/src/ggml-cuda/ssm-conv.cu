@@ -322,6 +322,10 @@ void ggml_cuda_op_conv_prepare(ggml_backend_cuda_context & ctx,const ggml_tensor
                 case 2: launch(flag,std::integral_constant<int,2>{}); break;
                 case 3: launch(flag,std::integral_constant<int,3>{}); break;
                 case 4: launch(flag,std::integral_constant<int,4>{}); break;
+                case 5: launch(flag,std::integral_constant<int,5>{}); break;
+                case 6: launch(flag,std::integral_constant<int,6>{}); break;
+                case 7: launch(flag,std::integral_constant<int,7>{}); break;
+                case 8: launch(flag,std::integral_constant<int,8>{}); break;
                 default: GGML_ABORT("unsupported conv batch");
             }
         };

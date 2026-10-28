@@ -11674,7 +11674,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Dense MTP gate/up fusion: every token count and both equal and mixed types.
     for (ggml_type up_type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS}) {
         for (ggml_type gate_type : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_IQ4_XS}) {
-            for (int64_t tokens : {2, 3, 4, 5}) {
+            for (int64_t tokens : {2, 3, 4, 5, 6, 8}) {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(up_type, GGML_GLU_OP_SWIGLU, tokens, 33, 5120,
                     false, 1, 1, false, false, true, false, {1, 1}, false, gate_type));
             }
@@ -12165,7 +12165,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
-    for (int64_t tokens : {1,2,3,4,5}) {
+    for (int64_t tokens : {1,2,3,4,5,6,7,8}) {
         for (bool reverse : {false,true}) {
             test_cases.emplace_back(new test_gdn_gates_q8(GGML_TYPE_Q8_0,48,tokens,reverse));
         }
@@ -12228,7 +12228,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     for (int64_t heads : {16, 48}) {
-        for (int64_t tokens : {1, 4, 5}) {
+        for (int64_t tokens : {1, 4, 5, 8}) {
             for (bool strided : {false, true}) {
                 test_cases.emplace_back(new test_rms_pair(heads, tokens, strided));
             }
@@ -12241,7 +12241,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     for (int64_t width : {128, 256}) {
         for (int64_t heads : {16, 48}) {
-            for (int64_t tokens : {1, 4, 5}) {
+            for (int64_t tokens : {1, 4, 5, 8}) {
                 test_cases.emplace_back(new test_rms_scale(width, heads, tokens));
             }
         }

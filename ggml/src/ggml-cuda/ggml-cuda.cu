@@ -4251,7 +4251,7 @@ static int ggml_cuda_try_gdn_gates(ggml_backend_cuda_context & ctx, ggml_cgraph 
         first->src[0]->ne[0] == 5120 && first->ne[0] == 48;
     const bool f32 = first->src[0]->type == GGML_TYPE_F32 && first->src[0]->ne[0] == 2048;
     if ((!q8 && !f32) || first->ne[0] < 16 || first->ne[0] > 128 ||
-            first->ne[1] < 1 || first->ne[1] > 4 || first->ne[2] != 1 || first->ne[3] != 1) { return 0; }
+            first->ne[1] < 1 || first->ne[1] > (q8 ? 8 : 4) || first->ne[2] != 1 || first->ne[3] != 1) { return 0; }
     const ggml_op patterns[2][9] = {
         {GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL,
          GGML_OP_RESHAPE, GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY},
@@ -4364,7 +4364,7 @@ static int ggml_cuda_try_rms_scale(ggml_backend_cuda_context & ctx, ggml_cgraph 
     if (norm->op != GGML_OP_RMS_NORM || scale->op != GGML_OP_SCALE || scale->src[0] != norm ||
             !(norm->flags & GGML_TENSOR_FLAG_COMPUTE) || !(scale->flags & GGML_TENSOR_FLAG_COMPUTE)) { return 0; }
     const auto * x = norm->src[0];
-    if (x->ne[0] != 128 || x->ne[1] > 64 || x->ne[2] > 4 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+    if (x->ne[0] != 128 || x->ne[1] > 64 || x->ne[2] > 8 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
             !ggml_is_contiguous(norm) || !ggml_is_contiguous(scale) || !ggml_are_same_shape(norm, scale)) { return 0; }
     for (const ggml_tensor * t : {x, static_cast<const ggml_tensor *>(norm), static_cast<const ggml_tensor *>(scale)}) {
         if (t->type != GGML_TYPE_F32 || !t->buffer || t->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
@@ -4583,7 +4583,7 @@ static int ggml_cuda_try_norm_gate(ggml_backend_cuda_context & ctx, ggml_cgraph 
     const auto * x = norm->src[0];
     const auto * weight = mul->src[1];
     const auto * gate = silu->src[0];
-    if (x->ne[0] != 128 || x->ne[1] < 1 || x->ne[1] > 64 || x->ne[2] < 1 || x->ne[2] > 4 || x->ne[3] != 1 ||
+    if (x->ne[0] != 128 || x->ne[1] < 1 || x->ne[1] > 64 || x->ne[2] < 1 || x->ne[2] > 8 || x->ne[3] != 1 ||
             ggml_nelements(weight) != 128 || weight->ne[0] != 128 || !ggml_are_same_shape(x, gate) ||
             !ggml_are_same_shape(x, dst)) { return 0; }
     for (const ggml_tensor * t : {x, weight, gate, static_cast<const ggml_tensor *>(norm),
@@ -4823,7 +4823,7 @@ static const ggml_tensor * ggml_cuda_gdn_gather_consumer(ggml_backend_cuda_conte
             if (gdn) { return nullptr; }
             // decide on the shape before scanning the rest of the graph (prefill graphs evaluate this every ubatch)
             if (t->type != GGML_TYPE_F32 || t->src[3]->ne[0] != 1 || t->src[2]->ne[0] != 128 || t->src[2]->ne[2] < 1 ||
-                    t->src[2]->ne[2] > 4 || t->src[2]->ne[3] != 1 || rows->ne[0] != 128*128*t->src[2]->ne[1]) { return nullptr; }
+                    t->src[2]->ne[2] > 8 || t->src[2]->ne[3] != 1 || rows->ne[0] != 128*128*t->src[2]->ne[1]) { return nullptr; }
             gdn = t;
             gdn_idx = j;
             continue;
@@ -4841,7 +4841,7 @@ static const ggml_tensor * ggml_cuda_gdn_gather_consumer(ggml_backend_cuda_conte
         }
     }
     if (!gdn || gdn->type != GGML_TYPE_F32 || gdn->src[3]->ne[0] != 1 || gdn->src[2]->ne[0] != 128 ||
-            gdn->src[2]->ne[2] < 1 || gdn->src[2]->ne[2] > 4 || gdn->src[2]->ne[3] != 1 ||
+            gdn->src[2]->ne[2] < 1 || gdn->src[2]->ne[2] > 8 || gdn->src[2]->ne[3] != 1 ||
             rows->ne[0] != 128*128*gdn->src[2]->ne[1]) { return nullptr; }
     for (const auto * t : {state, ids, rows, gdn}) {
         if (!t->buffer || t->buffer->buft != ggml_backend_cuda_buffer_type(ctx.device)) { return nullptr; }
@@ -4981,9 +4981,9 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
     }
     auto * concat=graph->nodes[i];
     if (concat->op!=GGML_OP_CONCAT || ggml_get_op_params_i32(concat,0)!=0 ||
-            concat->ne[0]<4 || concat->ne[0]>7 || concat->ne[1]%128!=0 || concat->ne[2]!=1 || concat->ne[3]!=1) { return 0; }
+            concat->ne[0]<4 || concat->ne[0]>11 || concat->ne[1]%128!=0 || concat->ne[2]!=1 || concat->ne[3]!=1) { return 0; }
     const auto * old=concat->src[0];const auto * input=concat->src[1];
-    // One token: contiguous column. Up to 4 tokens (speculative verification): transposed view of [C, N] projections.
+    // One token: contiguous column. Up to 8 tokens (speculative verification): transposed view of [C, N] projections.
     const int n_tokens=int(concat->ne[0])-3;
     if (old->ne[0]!=3 || input->ne[0]!=n_tokens || input->nb[1]!=sizeof(float) || !ggml_is_contiguous(old) ||
             (n_tokens==1 ? !ggml_is_contiguous(input) : input->nb[0]!=size_t(concat->ne[1])*sizeof(float))) { return 0; }
@@ -4992,7 +4992,7 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
     int conv_idx=-1;
     std::vector<int> copies;                 // conv state writes; speculative decoding keeps one per accepted length
     std::vector<ggml_tensor *> independent;  // nodes between the state copies and the convolution (recurrent state gather)
-    for(int j=i+1;j<graph->n_nodes && j<i+24;++j) {
+    for(int j=i+1;j<graph->n_nodes && j<i+48;++j) {
         auto *t=graph->nodes[j];
         if(ggml_cuda_is_view_or_noop(t)) {
             if(t->view_src==concat) { indices.push_back(j);ops.push_back(t->op); }
@@ -7162,7 +7162,7 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
                     return !value || std::atoi(value) != 0;
                 }();
                 const ggml_tensor * x = nullptr, * gate_out = nullptr, * beta_out = nullptr;
-                if (gates_deps && cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->ne[1] <= 4 &&
+                if (gates_deps && cgraph->nodes[i]->op == GGML_OP_MUL_MAT && cgraph->nodes[i]->ne[1] <= 8 &&
                         ggml_cuda_gdn_gates_nodes(cgraph, i, x, gate_out, beta_out)) {
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x), const_cast<ggml_tensor *>(gate_out));
                     params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(x), const_cast<ggml_tensor *>(beta_out));

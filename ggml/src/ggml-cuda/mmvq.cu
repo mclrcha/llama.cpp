@@ -627,6 +627,14 @@ static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int
     if (table_id == MMVQ_PARAMETERS_RDNA4 && !small_k && ncols_dst >= 2 && ncols_dst <= 4) {
         return GGML_HIP_MMVQ_RDNA4_ROWS;
     }
+    // 5..8 columns (speculative verify of longer drafts): one row per wave reloaded 8 activation columns per weight row
+    // and was L2 bound; same bit-identical row sharing (-DGGML_HIP_MMVQ_RDNA4_ROWS_WIDE=1 for the previous kernel).
+#ifndef GGML_HIP_MMVQ_RDNA4_ROWS_WIDE
+#define GGML_HIP_MMVQ_RDNA4_ROWS_WIDE 2
+#endif
+    if (table_id == MMVQ_PARAMETERS_RDNA4 && !small_k && ncols_dst >= 5 && ncols_dst <= 8) {
+        return GGML_HIP_MMVQ_RDNA4_ROWS_WIDE;
+    }
     return 1;
 }
 

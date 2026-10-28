@@ -2174,7 +2174,7 @@ static __global__ void gdn_gates_q8(const block_q8_0 * alpha, const block_q8_0 *
     if (lane < tokens) {
         if (is_alpha) {
             value += bias[row];
-            value = value > 20.0f ? value : logf(1.0f + expf(value));
+            value = value > 20.0f ? value : log1pf(expf(value)); // same as the SOFTPLUS op
             value *= scale[row];
         } else { value = 1.0f / (1.0f + expf(-value)); }
         (is_alpha ? output : beta_output)[lane*heads + row] = value;

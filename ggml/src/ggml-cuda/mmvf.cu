@@ -989,7 +989,7 @@ static __global__ void gdn_gates_f32(
         float value = sums[tid];
         if (is_alpha) {
             value += bias[row];
-            value = value > 20.0f ? value : logf(1.0f + expf(value));
+            value = value > 20.0f ? value : log1pf(expf(value)); // same as the SOFTPLUS op
             value *= scale[row];
         } else {
             value = 1.0f / (1.0f + expf(-value));

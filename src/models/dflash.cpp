@@ -549,7 +549,8 @@ static ggml_tensor * build_dflash2_conv(
                         weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])),
                 hidden_size, n_tokens);
 
-        ggml_tensor * term = ggml_mul(ctx0, weight, values);
+        // values first: the hidden input is computed before the conv nodes, which stay contiguous for the HIP fusion
+        ggml_tensor * term = ggml_mul(ctx0, values, weight);
         result = result ? ggml_add(ctx0, result, term) : term;
     }
     return result;

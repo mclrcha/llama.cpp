@@ -435,3 +435,35 @@ void ggml_cuda_conv_prefill(ggml_backend_cuda_context & ctx,const ggml_tensor * 
     if(scratch) { CUDA_CHECK(cudaMemcpyAsync(output->data,cat->data,ggml_nbytes(output),cudaMemcpyDeviceToDevice,ctx.stream())); }
 }
 #endif
+
+#if defined(GGML_USE_HIP)
+// DFlash2 local convolution, same operations as build_dflash2_conv: w = coeff + base per tap, term = x[t - tap] * w with
+// zero before the block start, terms added in tap order. Uncontracted, so the result matches the unfused graph.
+static __global__ void dflash_conv_f32(const float * __restrict__ x, const float * __restrict__ coeff,
+        const int64_t s_tap, const int64_t s_tok, const float * __restrict__ base, float * __restrict__ dst,
+        const int hidden, const int group, const int block, const int n_taps) {
+#pragma clang fp contract(off)
+    const int h = blockIdx.x*blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (h >= hidden) {
+        return;
+    }
+    const int g = h / group;
+    const int pos = t % block;
+    float acc = 0.0f;
+    for (int tap = 0; tap < n_taps; ++tap) {
+        const float w = coeff[t*s_tok + tap*s_tap + g] + base[(int64_t) tap*hidden + h];
+        const float v = pos >= tap ? x[(int64_t) (t - tap)*hidden + h] : 0.0f;
+        const float term = v * w;
+        acc = tap == 0 ? term : acc + term;
+    }
+    dst[(int64_t) t*hidden + h] = acc;
+}
+
+void ggml_cuda_dflash_conv(ggml_backend_cuda_context & ctx, const float * x, const float * coeff, int64_t s_tap,
+        int64_t s_tok, const float * base, float * dst, int hidden, int group, int n_tokens, int block, int n_taps) {
+    const dim3 grid((hidden + 255)/256, n_tokens);
+    dflash_conv_f32<<<grid, 256, 0, ctx.stream()>>>(x, coeff, s_tap, s_tok, base, dst, hidden, group, block, n_taps);
+    CUDA_CHECK(cudaGetLastError());
+}
+#endif

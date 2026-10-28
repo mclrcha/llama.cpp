@@ -5861,6 +5861,49 @@ struct test_rms_scale : public test_case {
     }
 };
 
+// DFlash2 local convolution, the graph of build_dflash2_conv (src/models/dflash.cpp); fused on HIP.
+struct test_dflash_conv : public test_case {
+    const int64_t hidden, group, kernel, block, n_blocks;
+    const int side;
+    test_dflash_conv(int64_t hidden, int64_t group, int64_t kernel, int64_t block, int64_t n_blocks, int side)
+        : hidden(hidden), group(group), kernel(kernel), block(block), n_blocks(n_blocks), side(side) {}
+    bool run_whole_graph() override { return true; }
+    std::string op_desc(ggml_tensor *) override { return "DFLASH_CONV"; }
+    std::string vars() override { return VARS_TO_STR6(hidden, group, kernel, block, n_blocks, side); }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_groups = hidden / group, n_tokens = block * n_blocks;
+        // the hidden input and the dynamic coefficients are computed nodes, like the matmul outputs in the model
+        ggml_tensor * hidden_t = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden, n_tokens), 0.5f);
+        ggml_tensor * dynamic  = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_groups * kernel * 2, n_tokens), 0.5f);
+        ggml_tensor * base     = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hidden, kernel, 2);
+
+        ggml_tensor * blocks = ggml_reshape_3d(ctx, hidden_t, hidden, block, n_blocks);
+        ggml_tensor * coeffs = ggml_reshape_4d(ctx, dynamic, n_groups, kernel, 2, n_tokens);
+        ggml_tensor * coeffs_side = ggml_view_3d(ctx, coeffs, n_groups, kernel, n_tokens, coeffs->nb[1], coeffs->nb[3], side * coeffs->nb[2]);
+        ggml_tensor * coeff_all = ggml_cont(ctx, coeffs_side);
+        coeff_all = ggml_reshape_4d(ctx, coeff_all, 1, n_groups, kernel, n_tokens);
+        coeff_all = ggml_repeat_4d(ctx, coeff_all, group, n_groups, kernel, n_tokens);
+        ggml_tensor * base_side = ggml_reshape_4d(ctx, ggml_view_1d(ctx, base, hidden * kernel, side * base->nb[2]), group, n_groups, kernel, 1);
+        ggml_tensor * weight_all = ggml_add(ctx, coeff_all, base_side);
+
+        const int64_t n_taps = std::min(kernel, block);
+        ggml_tensor * result = nullptr;
+        for (int64_t tap = 0; tap < n_taps; ++tap) {
+            ggml_tensor * values = blocks;
+            if (tap > 0) {
+                ggml_tensor * previous = ggml_view_3d(ctx, blocks, hidden, block - tap, n_blocks, blocks->nb[1], blocks->nb[2], 0);
+                values = ggml_pad_ext(ctx, previous, 0, 0, tap, 0, 0, 0, 0, 0);
+            }
+            values = ggml_reshape_2d(ctx, values, hidden, n_tokens);
+            ggml_tensor * weight = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_view_4d(ctx, weight_all, group, n_groups, 1, n_tokens,
+                    weight_all->nb[1], weight_all->nb[2], weight_all->nb[3], tap * weight_all->nb[2])), hidden, n_tokens);
+            ggml_tensor * term = ggml_mul(ctx, values, weight);
+            result = result ? ggml_add(ctx, result, term) : term;
+        }
+        return result;
+    }
+};
+
 struct test_gdn_gates_q8 : public test_case {
     const ggml_type type;
     const int64_t heads, tokens;
@@ -12207,6 +12250,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_rms_scale(128, 16, tokens, true));
         test_cases.emplace_back(new test_rms_scale(128, 16, tokens, false, true));
         test_cases.emplace_back(new test_rms_scale(128, 16, tokens, false, false, true));
+    }
+    for (int side : {0, 1}) {
+        for (auto [block, n_blocks] : std::initializer_list<std::pair<int64_t, int64_t>>{{4, 1}, {4, 2}, {8, 1}, {2, 3}, {1, 4}}) {
+            test_cases.emplace_back(new test_dflash_conv(5120, 16, 2, block, n_blocks, side));
+        }
+        test_cases.emplace_back(new test_dflash_conv(1024, 16, 3, 4, 2, side));
     }
     for (int64_t heads : {16, 32, 48, 128}) {
         for (int64_t tokens : {1, 2, 3, 4, 5}) {

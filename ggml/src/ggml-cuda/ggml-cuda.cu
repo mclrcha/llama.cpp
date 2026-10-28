@@ -5665,6 +5665,110 @@ static int ggml_cuda_try_cont_unary_mul_q8(ggml_backend_cuda_context & ctx, ggml
 #endif
 
 // try and fuse nodes and return the number of nodes to skip
+#if defined(GGML_USE_HIP)
+// DFlash2 local convolution (build_dflash2_conv in src/models/dflash.cpp): the nodes from the CONT of the side
+// coefficients to the last ADD (MUL for one tap), ~9 small ops and 3 copies per call, run as one kernel with the same
+// operations (GGML_HIP_DFLASH_CONV=0 off).
+static int ggml_cuda_try_dflash_conv(ggml_backend_cuda_context & ctx, ggml_cgraph * graph, int i) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_HIP_DFLASH_CONV");
+        return !value || std::atoi(value) != 0;
+    }();
+    constexpr int n_head = 6, n_tap0 = 4, n_tapn = 8, max_taps = 3;
+    if (!enabled || ctx.curr_stream_no != 0 || graph->nodes[i]->op != GGML_OP_CONT) { return 0; }
+    static const ggml_op head[n_head] = {GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_REPEAT, GGML_OP_VIEW, GGML_OP_RESHAPE, GGML_OP_ADD};
+    static const ggml_op tap0[n_tap0] = {GGML_OP_VIEW, GGML_OP_CONT, GGML_OP_RESHAPE, GGML_OP_MUL};
+    static const ggml_op tapn[n_tapn] = {GGML_OP_VIEW, GGML_OP_PAD, GGML_OP_RESHAPE, GGML_OP_VIEW, GGML_OP_CONT,
+        GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD};
+    int count = 0;
+    auto at = [&](int j) { return graph->nodes[i + j]; };
+    auto push = [&](const ggml_op * seq, int n) {
+        if (i + count + n > graph->n_nodes) { return false; }
+        for (int j = 0; j < n; ++j) {
+            if (at(count + j)->op != seq[j]) { return false; }
+        }
+        count += n;
+        return true;
+    };
+    if (!push(head, n_head) || !push(tap0, n_tap0)) { return 0; }
+
+    // side coefficients [n_groups, kernel, n_tokens] (a strided view), repeated over the group and added to the base
+    const ggml_tensor * cont = at(0);
+    const ggml_tensor * side = cont->src[0];
+    const ggml_tensor * rep  = at(2);
+    const ggml_tensor * base = at(4);
+    const ggml_tensor * wall = at(5);
+    const int64_t group = rep->ne[0], n_groups = rep->ne[1], kernel = rep->ne[2], n_tokens = rep->ne[3];
+    const int64_t hidden = group*n_groups;
+    if (side->op != GGML_OP_VIEW || side->nb[0] != sizeof(float) || side->ne[0] != n_groups || side->ne[1] != kernel ||
+            side->ne[2] != n_tokens || side->ne[3] != 1 || at(1)->src[0] != cont || at(1)->ne[0] != 1 || rep->src[0] != at(1) ||
+            base->src[0] != at(3) || !ggml_is_contiguous(base) || base->ne[0] != group || base->ne[1] != n_groups ||
+            base->ne[2] != kernel || base->ne[3] != 1 || wall->src[0] != rep || wall->src[1] != base ||
+            !ggml_is_contiguous(wall) || !ggml_are_same_shape(wall, rep)) { return 0; }
+
+    // VIEW, CONT, RESHAPE of tap `tap` of the weights, used as src1 of the MUL that follows
+    auto weight_ok = [&](int j, int tap) {
+        const ggml_tensor * v = at(j), * c = at(j + 1), * r = at(j + 2);
+        return v->src[0] == wall && v->view_offs == (size_t) tap*wall->nb[2] && v->ne[0] == group && v->ne[1] == n_groups &&
+            v->ne[2] == 1 && v->ne[3] == n_tokens && c->src[0] == v && r->src[0] == c && r->ne[0] == hidden &&
+            r->ne[1] == n_tokens && at(j + 3)->src[1] == r;
+    };
+    const ggml_tensor * x = at(9)->src[0];
+    if (!weight_ok(6, 0) || !ggml_is_contiguous(x) || x->ne[0] != hidden || x->ne[1] != n_tokens || ggml_nrows(x) != n_tokens) { return 0; }
+
+    // tap > 0: x viewed as [hidden, block - tap, n_blocks], padded with tap zeros at the block start, times the weights
+    int n_taps = 1, block = (int) n_tokens;
+    const ggml_tensor * out = at(9);
+    while (n_taps < kernel && n_taps < max_taps && push(tapn, n_tapn)) {
+        const int j = count - n_tapn;
+        const ggml_tensor * prev = at(j), * pad = at(j + 1), * rp = at(j + 2), * mul = at(j + 6), * add = at(j + 7);
+        const int64_t pblock = pad->ne[1];
+        bool ok = prev->data == x->data && prev->ne[0] == hidden && prev->ne[1] == pblock - n_taps &&
+            prev->nb[1] == x->nb[1] && prev->nb[2] == pblock*x->nb[1] && pad->src[0] == prev && pad->ne[0] == hidden &&
+            pblock*pad->ne[2] == n_tokens && pad->ne[3] == 1 && (n_taps == 1 || pblock == block) && rp->src[0] == pad &&
+            mul->src[0] == rp && weight_ok(j + 3, n_taps) && add->src[0] == out && add->src[1] == mul;
+        for (int p = 0; p < 9 && ok; ++p) {
+            ok = ggml_get_op_params_i32(pad, p) == (p == 2 ? n_taps : 0);
+        }
+        if (!ok) {
+            count -= n_tapn;
+            break;
+        }
+        block = (int) pblock;
+        out = add;
+        ++n_taps;
+    }
+
+    auto local = [&](const ggml_tensor * t) {
+        return t->type == GGML_TYPE_F32 && t->buffer && t->buffer->buft == ggml_backend_cuda_buffer_type(ctx.device);
+    };
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        const uintptr_t p = reinterpret_cast<uintptr_t>(a->data), q = reinterpret_cast<uintptr_t>(b->data);
+        return p < q + ggml_nbytes(b) && q < p + ggml_nbytes(a);
+    };
+    const int out_idx = i + count - 1;
+    if (at(count - 1) != out || !local(out) || !local(x) || !local(side) || !local(base) || !ggml_is_contiguous(out) ||
+            out->ne[0] != hidden || out->ne[1] != n_tokens || ggml_nrows(out) != n_tokens ||
+            overlaps(out, x) || overlaps(out, side) || overlaps(out, base)) { return 0; }
+    // like ggml_can_fuse_subgraph, except that the views of x (outside the chain, not a weight) are allowed: they only read
+    for (int j = 0; j < count; ++j) {
+        const ggml_tensor * t = at(j);
+        if (!(t->flags & GGML_TENSOR_FLAG_COMPUTE)) { return 0; }
+        if (i + j == out_idx) { continue; }
+        int uses = 0;
+        for (int k = j + 1; k < count; ++k) {
+            for (int s = 0; s < GGML_MAX_SRC; ++s) { uses += at(k)->src[s] == t; }
+        }
+        if ((t->flags & GGML_TENSOR_FLAG_OUTPUT) || uses != ggml_node_get_use_count(graph, i + j)) { return 0; }
+    }
+
+    ggml_cuda_dflash_conv(ctx, (const float *) x->data, (const float *) side->data, side->nb[1]/sizeof(float),
+        side->nb[2]/sizeof(float), (const float *) base->data, (float *) out->data, (int) hidden, (int) group,
+        (int) n_tokens, block, n_taps);
+    return count - 1;
+}
+#endif
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     if (ggml_cuda_fusion_disabled()) {
@@ -5673,6 +5777,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 #if defined(GGML_USE_HIP)
+    const int dflash_conv_skip = ggml_cuda_try_dflash_conv(*cuda_ctx, cgraph, i);
+    if (dflash_conv_skip) { return dflash_conv_skip; }
     const int prefill_gate_up_skip = ggml_cuda_try_prefill_gate_up(*cuda_ctx, cgraph, i);
     if (prefill_gate_up_skip) { return prefill_gate_up_skip; }
     const int prefill_silu_skip=ggml_cuda_try_prefill_silu_quant(*cuda_ctx,cgraph,i);

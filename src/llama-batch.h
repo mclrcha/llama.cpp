@@ -123,7 +123,7 @@ struct llama_batch_ext {
     std::vector<float> embd;
     std::vector<float> state;
 
-    // non-owning embd rows used instead of `embd` when set (llama_batch_compat with borrow_embd)
+    // non-owning embd rows used instead of `embd` when set (llama_batch_compat with borrow_embd, borrow_embd())
     // they must stay valid until the batch is decoded
     const float * embd_borrowed = nullptr;
 
@@ -150,6 +150,8 @@ struct llama_batch_ext {
     bool add_seq(int32_t idx, llama_seq_id seq_id);
     bool set_token_id(int32_t idx, llama_token id);
     bool set_token_embd(int32_t idx, llama_embd embd_in);
+    // on an empty batch: the next embeddings are the consecutive rows of data (see llama_batch_ext_borrow_embd)
+    bool borrow_embd(const float * data);
     bool set_token_state(int32_t idx, llama_embd state_in);
     bool set_token_pos(int32_t idx, const llama_pos * pos_in);
     bool set_output(int32_t idx, bool output_last);

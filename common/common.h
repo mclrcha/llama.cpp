@@ -1113,8 +1113,12 @@ struct common_batch {
 
     llama_batch_ext * get() { return get_sub_batch(0, size()); }
 
+    // as get(), but the embeddings, consecutive rows of one buffer, are referenced instead of copied: the buffer must
+    // stay valid until the batch is processed
+    llama_batch_ext * get_borrowed() { return get_sub_batch(0, size(), true); }
+
     // render entries [off, off + n) into batch, the result is overwritten by the next call
-    llama_batch_ext * get_sub_batch(int32_t off, int32_t n);
+    llama_batch_ext * get_sub_batch(int32_t off, int32_t n, bool borrow_embd = false);
 
     // content type of the batch, all entries carry the same combination
     bool has_token() const { return !tokens.empty() && tokens[0].id != LLAMA_TOKEN_NULL; }

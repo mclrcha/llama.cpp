@@ -428,6 +428,51 @@ static void test_content_types(testing & t) {
         t.assert_equal(105.0f, ub.embd[n_embd_enc + 5]);
     });
 
+    t.test("borrowed_embd_rows", [&](testing & t) {
+        // e.g. dflash feature injection: the rows are referenced, not copied
+        const uint32_t n_embd_enc = 6;
+        batch_builder bb(2, nullptr, 4, 1, 0, n_embd_enc);
+
+        std::vector<float> rows(2*n_embd_enc);
+        for (size_t i = 0; i < rows.size(); ++i) {
+            rows[i] = 200.0f + i;
+        }
+        t.assert_true(bb.b.borrow_embd(rows.data()));
+        for (int32_t i = 0; i < 2; ++i) {
+            const int32_t idx = bb.b.add_token(0);
+            const llama_pos pos = i;
+            t.assert_true(bb.b.set_token_embd(idx, { rows.data() + (size_t) i*n_embd_enc, 1, n_embd_enc }));
+            bb.b.set_token_pos(idx, &pos);
+            bb.b.set_output(idx, i == 1);
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+        t.assert_true("rows are referenced", ba.get_batch().embd == rows.data());
+
+        llama_ubatch ub = ba.split_simple(2);
+        t.assert_equal(2u, ub.n_tokens);
+        t.assert_equal(205.0f, ub.embd[5]);
+        t.assert_equal(206.0f, ub.embd[n_embd_enc]);
+    });
+
+    t.test("borrowed_embd_rejects", [&](testing & t) {
+        const uint32_t n_embd_enc = 6;
+        std::vector<float> rows(2*n_embd_enc, 1.0f);
+        {
+            batch_builder bb(2, nullptr, 4, 1, 0, n_embd_enc);
+            t.assert_true(bb.b.borrow_embd(rows.data()));
+            const int32_t idx = bb.b.add_token(0);
+            t.assert_true("row 1 for token 0", !bb.b.set_token_embd(idx, { rows.data() + n_embd_enc, 1, n_embd_enc }));
+        }
+        {
+            batch_builder bb(2, nullptr, 4, 1, 0, n_embd_enc);
+            const llama_pos p0 = 0;
+            bb.add_embd(&p0, {0}, false, n_embd_enc);
+            t.assert_true("only on an empty batch", !bb.b.borrow_embd(rows.data()));
+        }
+    });
+
     t.test("rejects_mixing_widths", [&](testing & t) {
         batch_builder bb(2, nullptr, 4, 1, 0, /*n_embd_inp_enc*/ 6);
 

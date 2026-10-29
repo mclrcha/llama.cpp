@@ -1272,14 +1272,28 @@ bool llama_batch_ext::set_token_embd(int32_t idx, llama_embd embd_in) {
         return false;
     }
     if (embd_borrowed) {
-        LLAMA_LOG_ERROR("%s: cannot mix owned and borrowed embeddings\n", __func__);
-        return false;
+        // borrowed rows: token idx is row idx of the borrowed data
+        if (embd_in.data != embd_borrowed + (size_t) idx*n_total) {
+            LLAMA_LOG_ERROR("%s: embedding of token %d is not row %d of the borrowed embeddings\n", __func__, idx, idx);
+            return false;
+        }
+        t.has_embd = true;
+        t.embd_off = (size_t) idx*n_total;
+        return true;
     }
 
     t.has_embd = true;
     t.embd_off = embd.size();
     embd.insert(embd.end(), embd_in.data, embd_in.data + n_total);
 
+    return true;
+}
+
+bool llama_batch_ext::borrow_embd(const float * data) {
+    if (!data || !tokens.empty() || !embd.empty()) {
+        return false;
+    }
+    embd_borrowed = data;
     return true;
 }
 
@@ -1395,6 +1409,10 @@ bool llama_batch_ext_add_seq(llama_batch_ext * batch, int32_t idx, llama_seq_id 
 
 bool llama_batch_ext_set_pos(llama_batch_ext * batch, int32_t idx, const llama_pos * pos) {
     return batch->set_token_pos(idx, pos);
+}
+
+bool llama_batch_ext_borrow_embd(llama_batch_ext * batch, const float * data) {
+    return batch->borrow_embd(data);
 }
 
 bool llama_batch_ext_set_embd_token(llama_batch_ext * batch, int32_t idx, llama_embd embd) {

@@ -2288,12 +2288,16 @@ int32_t common_batch::add_embd(llama_embd embd, const llama_pos * pos, llama_seq
     return size() - 1;
 }
 
-llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n) {
+llama_batch_ext * common_batch::get_sub_batch(int32_t off, int32_t n, bool borrow_embd) {
     GGML_ASSERT(batch && "common_batch was not initialized with a context");
     GGML_ASSERT(off >= 0 && n >= 0 && off + n <= size());
 
     llama_batch_ext * res = batch.get();
     llama_batch_ext_clear(res);
+
+    if (borrow_embd && n > 0 && !llama_batch_ext_borrow_embd(res, tokens[off].embd.data)) {
+        GGML_ABORT("%s: cannot borrow the embeddings of entry %d\n", __func__, off);
+    }
 
     for (int32_t i = off; i < off + n; ++i) {
         const token & t = tokens[i];

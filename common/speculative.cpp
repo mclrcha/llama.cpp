@@ -997,7 +997,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     common_batch batch;        // noise tokens
     common_batch batch_inject; // target features for KV cache injection
 
-    std::vector<float> features_buf; // [n_chunk, n_embd_enc] gathered target features
+    // [n_chunk, n_embd_enc] gathered target features, referenced by batch_inject: pinned host memory of the GPU
+    // backend when it has one, else features_buf (LLAMA_DFLASH_BORROW=0: features_buf, copied into the batch)
+    const bool              borrow_features = [] { const char * v = getenv("LLAMA_DFLASH_BORROW"); return !v || atoi(v) != 0; }();
+    ggml_backend_buffer_ptr features_pinned;
+    bool                    features_pinned_failed = false;
+    std::vector<float>      features_buf;
+
+    float * features_rows(size_t n_floats, size_t n_floats_max) {
+        if (features_pinned && ggml_backend_buffer_get_size(features_pinned.get()) >= n_floats*sizeof(float)) {
+            return (float *) ggml_backend_buffer_get_base(features_pinned.get());
+        }
+        if (borrow_features && !features_pinned_failed) {
+            features_pinned.reset();
+            ggml_backend_dev_t dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+            ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+            if (buft) {
+                features_pinned.reset(ggml_backend_buft_alloc_buffer(buft, std::max(n_floats, n_floats_max)*sizeof(float)));
+            }
+            if (features_pinned) {
+                return (float *) ggml_backend_buffer_get_base(features_pinned.get());
+            }
+            features_pinned_failed = true;
+        }
+        features_buf.resize(n_floats);
+        return features_buf.data();
+    }
 
     std::vector<common_sampler_ptr> smpls;
 
@@ -1245,14 +1270,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                 // gather target features per extract layer; the fused decode encodes and
                 // injects them into the K/V cache at the target positions
-                features_buf.resize((size_t) n_chunk * n_embd_enc);
+                float * features = features_rows((size_t) n_chunk * n_embd_enc, (size_t) n_ubatch * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
                     const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
                     if (!layer) {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
+                        float       * dst = features + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
@@ -1262,9 +1287,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 for (int32_t i = 0; i < n_chunk; ++i) {
                     const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
-                    batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
+                    batch_inject.add_embd({ features + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
-                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_inject.get());
+                // the rows are read by the upload during llama_process: borrowed, not copied
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE,
+                        borrow_features ? batch_inject.get_borrowed() : batch_inject.get());
                 if (rc != 0) {
                     LOG_ERR("%s: llama_process(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);

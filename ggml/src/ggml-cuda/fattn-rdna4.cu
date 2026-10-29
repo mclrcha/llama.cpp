@@ -855,10 +855,13 @@ constexpr int K_BYTES   = BC*K_STRIDE*2;
 constexpr int VT_BYTES  = D*VT_STRIDE*2;
 constexpr int SMEM      = K_BYTES + VT_BYTES + NW*256*4;
 constexpr int QB        = 34;         // bytes per q8_0 block
+// 6 or 8 waves: 48 or 64 Q columns per KV head (5..8 token verify batches); the first NW waves load K/V
+constexpr int smem(const int nwd) { return K_BYTES + VT_BYTES + nwd*256*4; }
 }
 
 
-__launch_bounds__(fattn_r4d::NW*WARP_SIZE, 1)
+template <int NWD>
+__launch_bounds__(NWD*WARP_SIZE, 1)
 static __global__ void fattn_rdna4_dec_q8(
         const char * __restrict__ Q, const char * __restrict__ K, const char * __restrict__ V,
         const char * __restrict__ mask, float * __restrict__ dst, float2 * __restrict__ dst_meta,
@@ -876,6 +879,7 @@ static __global__ void fattn_rdna4_dec_q8(
     const int w    = threadIdx.y;
     const int g    = w >> 1;      // group of 16 columns
     const int c    = w & 1;       // KV half of S and DV half of O
+    const bool loader = NWD == NW || w < NW; // waves that load and store K/V
     const int h    = lane >> 4;
     const int lq   = lane & 15;
     const int tid  = w*WARP_SIZE + lane;
@@ -934,6 +938,9 @@ static __global__ void fattn_rdna4_dec_q8(
     };
     auto load_tile = [&](stage & st, const int kv0) {
         st.m = *(const int4 *) (mrow + int64_t(kv0 + 16*c + 8*h)*sizeof(half));
+        if (!loader) {
+            return;
+        }
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             const char * kr = Kh + int64_t(kv0 + krow + 8*i)*nb11;
@@ -966,6 +973,7 @@ static __global__ void fattn_rdna4_dec_q8(
     auto step = [&](stage & st, const int kv0, const bool next) {
         fattn_r4_lds_barrier(); // previous step is done with K, V^T and S in SRAM
 
+        if (loader) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
             __align__(16) half2 v[8];
@@ -988,6 +996,7 @@ static __global__ void fattn_rdna4_dec_q8(
                 *(half2 *) (sVT + (8*cv + 2*e    )*VT_STRIDE + 2*lq) = make_half2(__low2half(a[e]),  __low2half(b[e]));
                 *(half2 *) (sVT + (8*cv + 2*e + 1)*VT_STRIDE + 2*lq) = make_half2(__high2half(a[e]), __high2half(b[e]));
             }
+        }
         }
         fattn_r4_lds_barrier();
 
@@ -1196,7 +1205,7 @@ bool ggml_cuda_flash_attn_ext_rdna4_dec_supported(int device, const ggml_tensor 
         return false;
     }
     if (K->ne[1] < min_kv || K->ne[1] % fattn_r4d::BC != 0 || K->ne[1] != V->ne[1] || K->ne[2] != V->ne[2] ||
-            Q->ne[2] % K->ne[2] != 0 || Q->ne[1]*(Q->ne[2]/K->ne[2]) > 32) {
+            Q->ne[2] % K->ne[2] != 0 || Q->ne[1]*(Q->ne[2]/K->ne[2]) > 64) {
         return false;
     }
     if (K->ne[3] != Q->ne[3] || V->ne[3] != Q->ne[3]) {
@@ -1260,11 +1269,22 @@ void ggml_cuda_flash_attn_ext_rdna4_dec(ggml_backend_cuda_context & ctx, ggml_te
 
     const int64_t nb33 = mask->ne[3] > 1 ? mask->nb[3] : 0;
     const dim3 grid(K->ne[2], pb, ne03);
-    const dim3 block(WARP_SIZE, fattn_r4d::NW);
-    fattn_rdna4_dec_q8<<<grid, block, fattn_r4d::SMEM, stream>>>(
-        (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, out, dst_meta.ptr,
-        scale, ne01, ne02, gqa, nsteps, Q->nb[1], Q->nb[2], Q->nb[3],
-        K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], mask->nb[1], nb33);
+    const int ncols = ne01*gqa;
+    auto launch = [&](auto nwd) {
+        constexpr int NWD = decltype(nwd)::value;
+        fattn_rdna4_dec_q8<NWD><<<grid, dim3(WARP_SIZE, NWD), fattn_r4d::smem(NWD), stream>>>(
+            (const char *) Q->data, (const char *) K->data, (const char *) V->data, (const char *) mask->data, out, dst_meta.ptr,
+            scale, ne01, ne02, gqa, nsteps, Q->nb[1], Q->nb[2], Q->nb[3],
+            K->nb[1], K->nb[2], K->nb[3], V->nb[1], V->nb[2], V->nb[3], mask->nb[1], nb33);
+    };
+    if (ncols <= 32) {
+        launch(std::integral_constant<int, fattn_r4d::NW>{});
+    } else if (ncols <= 48) {
+        launch(std::integral_constant<int, 6>{});
+    } else {
+        GGML_ASSERT(ncols <= 64);
+        launch(std::integral_constant<int, 8>{});
+    }
     CUDA_CHECK(cudaGetLastError());
 
     if (pb > 1) {

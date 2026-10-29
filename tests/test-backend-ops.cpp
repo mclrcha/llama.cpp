@@ -10469,9 +10469,10 @@ static void add_qwen_kv_cases(std::vector<std::unique_ptr<test_case>> & cases, b
         for (int kv : {512, 8192, 32768, 131072}) {
             if (!perf && kv >= 32768) { continue; }
             if (kv == 131072 && nh != 4) { continue; }
-            for (int nb : {1, 2, 3, 4, 5}) {
+            for (int nb : {1, 2, 3, 4, 5, 6, 7, 8}) {
                 for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-                    if (nh == 2 && type == GGML_TYPE_Q8_0) { continue; }
+                    // gqa 8 with q8_0 only for the 33..64 column decode kernel (6..8 tokens)
+                    if (nh == 2 && type == GGML_TYPE_Q8_0 && nb < 6) { continue; }
                     if (kv == 131072 && (nb < 3 || type != GGML_TYPE_Q8_0)) { continue; }
                     cases.emplace_back(new test_flash_attn_ext(256, 256, nh, {gqa, 1}, kv, nb, true, false, 0, 0,
                         GGML_PREC_F32, type, type, {0, 2, 1, 3}));

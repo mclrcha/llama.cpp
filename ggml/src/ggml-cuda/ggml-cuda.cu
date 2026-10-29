@@ -5448,43 +5448,57 @@ static int ggml_cuda_try_conv_prefill(ggml_backend_cuda_context & ctx,ggml_cgrap
     const int64_t n=input->ne[0],h=cat->ne[1];
     if(n<32 || n>65535*32 || h%128 || old->ne[0]!=3 || old->ne[1]!=h || input->ne[1]!=h ||
             input->ne[2]!=1 || input->ne[3]!=1 || input->nb[0]!=h*4 || input->nb[1]!=4 || !ggml_is_contiguous(old)) { return 0; }
-    std::vector<int> indices{i};std::vector<ggml_op> ops{GGML_OP_CONCAT};
-    int cp=-1,cv=-1;
-    for(int j=i+1;j<graph->n_nodes && j<i+16;++j) {
+    // speculative decoding copies one state window per rollback slot (n_rs_seq + 1), see build_conv_state;
+    // GGML_HIP_PREFILL_CONV_SNAP=0 leaves those graphs unfused
+    static const bool snaps_enabled=[] { const char * v=getenv("GGML_HIP_PREFILL_CONV_SNAP"); return !v || atoi(v)!=0; }();
+    std::vector<int> indices{i},copies;std::vector<ggml_op> ops{GGML_OP_CONCAT};
+    int cv=-1;
+    for(int j=i+1;j<graph->n_nodes && j<i+48;++j) {
         auto * t=graph->nodes[j];
         if(ggml_cuda_is_view_or_noop(t)) { if(t->view_src==cat) { indices.push_back(j);ops.push_back(t->op); } continue; }
-        if(t->op==GGML_OP_CPY && cp<0 && t->src[0]->view_src==cat) { cp=j;indices.push_back(j);ops.push_back(t->op);continue; }
-        if(t->op==GGML_OP_SSM_CONV && cp>=0 && t->src[0]==cat) { cv=j; }
+        if(t->op==GGML_OP_CPY && t->src[0]->view_src==cat && copies.size()<8) {
+            copies.push_back(j);indices.push_back(j);ops.push_back(t->op);continue;
+        }
+        if(t->op==GGML_OP_SSM_CONV && !copies.empty() && t->src[0]==cat) { cv=j; }
         break;
     }
-    if(cv<0 || cv+1>=graph->n_nodes) { return 0; }
-    auto * conv=graph->nodes[cv],*out=graph->nodes[cv+1],*copy=graph->nodes[cp];
-    const auto * w=conv->src[1],*state=copy->src[1],*view=copy->src[0];
+    if(cv<0 || cv+1>=graph->n_nodes || (copies.size()>1 && !snaps_enabled)) { return 0; }
+    auto * conv=graph->nodes[cv],*out=graph->nodes[cv+1];
+    const auto * w=conv->src[1];
     if(out->op!=GGML_OP_UNARY || ggml_get_unary_op(out)!=GGML_UNARY_OP_SILU || out->src[0]!=conv ||
-            view->view_offs!=size_t(n*4) || view->ne[0]!=3 || view->ne[1]!=h || ggml_nelements(view)!=3*h ||
-            view->nb[0]!=4 || view->nb[1]!=size_t((n+3)*4) || ggml_nelements(state)!=3*h ||
             w->ne[0]!=4 || w->ne[1]!=h || ggml_nelements(w)!=4*h || out->ne[0]!=h || ggml_nelements(out)!=h*n) { return 0; }
-    for(const ggml_tensor * t:{old,input,w,state,static_cast<const ggml_tensor *>(cat),static_cast<const ggml_tensor *>(out)}) {
+    for(const ggml_tensor * t:{old,input,w,static_cast<const ggml_tensor *>(cat),static_cast<const ggml_tensor *>(out)}) {
         if(t->type!=GGML_TYPE_F32 || (t!=input && !ggml_is_contiguous(t)) || !t->buffer || t->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
     }
-    indices.push_back(cv);ops.push_back(GGML_OP_SSM_CONV);indices.push_back(cv+1);ops.push_back(GGML_OP_UNARY);
-    const int outputs[]={cp,cv+1};
-    if(!ggml_can_fuse_subgraph_ext(graph,indices.data(),indices.size(),ops.data(),outputs,2)) { return 0; }
     const auto overlaps=[](const ggml_tensor * a,const ggml_tensor * b) {
         const uintptr_t x=(uintptr_t)a->data,y=(uintptr_t)b->data;
         return x<y+ggml_nbytes(b) && y<x+ggml_nbytes(a);
     };
-    if(overlaps(state,out)) { return 0; }
-    bool scratch=false;
-    for(const auto * in:{old,input,w}) {
-        if(overlaps(state,in)) { return 0; }
-        scratch=scratch || overlaps(out,in);
+    // one window: the final one, to `state`; several: each window [keep, keep + 3) of cat with 1 <= keep <= n
+    ggml_cuda_conv_states snaps{};
+    for(const int cp:copies) {
+        const auto * view=graph->nodes[cp]->src[0],*state=graph->nodes[cp]->src[1];
+        const size_t keep=view->view_offs/4;
+        if(view->view_offs%4 || keep<1 || keep>size_t(n) || (copies.size()==1 && keep!=size_t(n)) ||
+                view->ne[0]!=3 || view->ne[1]!=h || ggml_nelements(view)!=3*h ||
+                view->nb[0]!=4 || view->nb[1]!=size_t((n+3)*4) || ggml_nelements(state)!=3*h ||
+                state->type!=GGML_TYPE_F32 || !ggml_is_contiguous(state) || !state->buffer ||
+                state->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device) || overlaps(state,out) || overlaps(state,cat)) { return 0; }
+        for(const auto * in:{old,input,w}) { if(overlaps(state,in)) { return 0; } }
+        for(int d=0;d<snaps.n;++d) { if(overlaps(state,graph->nodes[copies[d]]->src[1])) { return 0; } }
+        snaps.dst[snaps.n]=static_cast<float *>(state->data);snaps.keep[snaps.n]=int(keep);++snaps.n;
     }
+    indices.push_back(cv);ops.push_back(GGML_OP_SSM_CONV);indices.push_back(cv+1);ops.push_back(GGML_OP_UNARY);
+    std::vector<int> outputs=copies;outputs.push_back(cv+1);
+    if(!ggml_can_fuse_subgraph_ext(graph,indices.data(),indices.size(),ops.data(),outputs.data(),outputs.size())) { return 0; }
+    bool scratch=false;
+    for(const auto * in:{old,input,w}) { scratch=scratch || overlaps(out,in); }
     if(scratch) {
-        if(overlaps(cat,out) || overlaps(cat,state)) { return 0; }
+        if(overlaps(cat,out)) { return 0; }
         for(const auto * in:{old,input,w}) { if(overlaps(cat,in)) { return 0; } }
     }
-    ggml_cuda_conv_prefill(ctx,cat,w,state,out,scratch);
+    const auto * state=graph->nodes[copies[0]]->src[1];
+    ggml_cuda_conv_prefill(ctx,cat,w,state,out,scratch,copies.size()>1 ? &snaps : nullptr);
     return cv+1-i;
 }
 #endif

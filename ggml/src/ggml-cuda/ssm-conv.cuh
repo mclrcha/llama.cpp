@@ -12,8 +12,10 @@ void ggml_cuda_op_conv_prepare(ggml_backend_cuda_context & ctx,const ggml_tensor
 #endif
 
 #if defined(GGML_USE_HIP)
+// states: rollback windows written instead of `state` (null: only the final window, to `state`)
 void ggml_cuda_conv_prefill(ggml_backend_cuda_context & ctx,const ggml_tensor * cat,
-    const ggml_tensor * weight,const ggml_tensor * state,ggml_tensor * output,bool scratch);
+    const ggml_tensor * weight,const ggml_tensor * state,ggml_tensor * output,bool scratch,
+    const ggml_cuda_conv_states * states=nullptr);
 #endif
 
 #if defined(GGML_USE_HIP)

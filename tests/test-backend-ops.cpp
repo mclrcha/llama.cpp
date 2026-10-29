@@ -4799,6 +4799,58 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GDN prefill conv as built by build_conv_state with speculative rollback: concat(old state, transposed input), one
+// state window copy per rollback slot into the conv state cache, ssm_conv + silu (fused by the HIP prefill conv)
+struct test_conv_prefill_states : public test_case {
+    const int64_t channels, n_tokens, n_slots;
+    std::vector<ggml_tensor *> copies;
+    ggml_tensor * out = nullptr;
+
+    std::string op_desc(ggml_tensor *) override { return "CONV_PREFILL_STATES"; }
+    std::string vars() override { return VARS_TO_STR3(channels, n_tokens, n_slots); }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        std::vector<ggml_tensor *> nodes = copies;
+        nodes.push_back(out);
+        return nodes;
+    }
+
+    test_conv_prefill_states(int64_t channels, int64_t n_tokens, int64_t n_slots)
+        : channels(channels), n_tokens(n_tokens), n_slots(n_slots) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t mem_size = 2, head = 1;
+        ggml_tensor * old    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, channels, 1);
+        ggml_tensor * input  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, channels, n_tokens, 1);
+        ggml_tensor * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+        ggml_tensor * cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 3*channels, n_slots*mem_size);
+        ggml_set_name(old, "old");
+        ggml_set_name(input, "input");
+        ggml_set_name(weight, "weight");
+        ggml_set_name(cache, "cache");
+
+        ggml_tensor * cat = ggml_concat(ctx, old, ggml_transpose(ctx, input), 0);
+        const size_t row_size = ggml_row_size(GGML_TYPE_F32, 3*channels);
+        copies.clear();
+        for (int64_t t = 1; t <= n_slots; ++t) {
+            const int64_t keep = std::max<int64_t>(0, n_tokens - n_slots + t);
+            ggml_tensor * window = ggml_view_3d(ctx, cat, 3, channels, 1, cat->nb[1], cat->nb[2],
+                    ggml_row_size(cat->type, keep));
+            ggml_tensor * slot = ggml_view_2d(ctx, cache, 3*channels, 1, cache->nb[1],
+                    ((n_slots - t)*mem_size + head)*row_size);
+            copies.push_back(ggml_cpy(ctx, window, slot));
+            // the copies come before the convolution, as in the model graph
+            if (mode == MODE_TEST && gf) {
+                ggml_build_forward_expand(gf, copies.back());
+            }
+        }
+
+        out = ggml_silu(ctx, ggml_ssm_conv(ctx, cat, weight));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11481,6 +11533,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             // long token (n_t > 32, exercises the long_token kernel path)
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv - 1 + 64, d_inner, 4, 1}, {d_conv, d_inner, 1, 1}));
+        }
+    }
+
+    for (int64_t channels : {256, 1024}) {
+        for (int64_t n_tokens : {32, 33, 61, 64, 200, 2048}) {
+            for (int64_t n_slots : {1, 2, 5, 8}) {
+                test_cases.emplace_back(new test_conv_prefill_states(channels, n_tokens, n_slots));
+            }
         }
     }
 

@@ -297,10 +297,12 @@ static __global__ void conv_prepare_silu_f32(const float * old_state,const float
 
 void ggml_cuda_op_conv_prepare(ggml_backend_cuda_context & ctx,const ggml_tensor * concat,
         const ggml_tensor * weight,const ggml_tensor * state,ggml_tensor * output,const ggml_tensor * gathered,
-        const ggml_tensor *norm,ggml_tensor *q,ggml_tensor *k,const ggml_cuda_conv_states * states) {
+        const ggml_tensor *norm,ggml_tensor *q,ggml_tensor *k,const ggml_cuda_conv_states * states,bool staged) {
     const int n_tokens=int(concat->ne[0])-3;
     if(n_tokens>1) {
         GGML_ASSERT(states && states->n>=1 && states->n<=8);
+        ggml_cuda_pool_alloc<float> stage(ctx.pool());
+        float * out_d=staged ? stage.alloc(ggml_nelements(output)) : static_cast<float *>(output->data);
         conv_qk_args qk{};
         if(norm) { qk={static_cast<float *>(q->data),static_cast<float *>(k->data),int(norm->ne[1]),
             ggml_get_op_params_f32(norm,0),ggml_get_op_params_f32(q,0),ggml_get_op_params_f32(q,1)}; }
@@ -311,7 +313,7 @@ void ggml_cuda_op_conv_prepare(ggml_backend_cuda_context & ctx,const ggml_tensor
                         decltype(normalize)::value>,params,
                     static_cast<const float *>(gathered ? gathered->src[0]->data : concat->src[0]->data),
                     static_cast<const float *>(concat->src[1]->data),static_cast<const float *>(weight->data),
-                    static_cast<float *>(output->data),
+                    out_d,
                     gathered ? static_cast<const int32_t *>(gathered->src[1]->data) : nullptr,
                     gathered ? int64_t(gathered->src[0]->nb[1]/sizeof(float)) : 0,int(concat->ne[1]),*states,qk);
             };
@@ -330,6 +332,9 @@ void ggml_cuda_op_conv_prepare(ggml_backend_cuda_context & ctx,const ggml_tensor
             }
         };
         if(gathered) { dispatch(std::true_type{}); } else { dispatch(std::false_type{}); }
+        if(staged) {
+            CUDA_CHECK(cudaMemcpyAsync(output->data,out_d,ggml_nbytes(output),cudaMemcpyDeviceToDevice,ctx.stream()));
+        }
         return;
     }
     conv_qk_args qk{};

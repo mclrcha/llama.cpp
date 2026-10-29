@@ -8,7 +8,7 @@ struct ggml_cuda_conv_states { float * dst[8]; int keep[8]; int n; };
 
 void ggml_cuda_op_conv_prepare(ggml_backend_cuda_context & ctx,const ggml_tensor * concat,
         const ggml_tensor * weight,const ggml_tensor * state,ggml_tensor * output,const ggml_tensor * gathered,
-        const ggml_tensor *norm,ggml_tensor *q,ggml_tensor *k,const ggml_cuda_conv_states * states=nullptr);
+        const ggml_tensor *norm,ggml_tensor *q,ggml_tensor *k,const ggml_cuda_conv_states * states=nullptr,bool staged=false);
 #endif
 
 #if defined(GGML_USE_HIP)

@@ -373,7 +373,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
         const char * value = std::getenv("LLAMA_GDN_EARLY_Z_BATCH");
         return !value || std::atoi(value) != 0;
     }();
-    if (early_z_batch && ubatch.n_tokens <= 4) {
+    if (early_z_batch && ubatch.n_tokens <= 8) {
         ggml_build_forward_expand(gf, z);
         ggml_build_forward_expand(gf, qkv_mixed);
     }

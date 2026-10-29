@@ -3069,7 +3069,7 @@ static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
         return !value || std::atoi(value) != 0;
     }();
     const int64_t n_tokens = cgraph->nodes[0]->ne[1];
-    if (token_cache && cgraph->n_nodes <= 256 && n_tokens >= 1 && n_tokens <= 4) {
+    if (token_cache && cgraph->n_nodes <= 256 && n_tokens >= 1 && n_tokens <= 8) {
         key.n_tokens = n_tokens;
     }
 #endif
@@ -5042,8 +5042,10 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
         return x<y+ggml_nbytes(b) && y<x+ggml_nbytes(a);
     };
     const auto * source=gathered ? gathered->src[0] : old;
-    if(overlaps(silu,source) || overlaps(silu,weight) || (overlaps(silu,input) && silu->data!=input->data) ||
-            overlaps(concat,weight)) { return 0; }
+    // An output that partially aliases the old states or the input (the allocation changes with the token count) would
+    // race with other channels' reads: the batched kernel writes it to a pool buffer and copies it (same values).
+    const bool staged=overlaps(silu,source) || (overlaps(silu,input) && silu->data!=input->data);
+    if((staged && n_tokens==1) || overlaps(silu,weight) || overlaps(concat,weight)) { return 0; }
     if(gathered) {
         for(const auto *t:{gathered->src[0],gathered->src[1]}) {
             if(!t->buffer || t->buffer->buft!=ggml_backend_cuda_buffer_type(ctx.device)) { return 0; }
@@ -5142,7 +5144,7 @@ static int ggml_cuda_try_conv_prepare(ggml_backend_cuda_context & ctx,ggml_cgrap
         conv_states.dst[c]=static_cast<float *>(graph->nodes[copies[c]]->src[1]->data);
         conv_states.keep[c]=int(graph->nodes[copies[c]]->src[0]->view_offs/sizeof(float));
     }
-    ggml_cuda_op_conv_prepare(ctx,concat,weight,state,silu,gathered,qnorm,qout,kout,&conv_states);
+    ggml_cuda_op_conv_prepare(ctx,concat,weight,state,silu,gathered,qnorm,qout,kout,&conv_states,staged);
     return last-first;
 }
 #endif

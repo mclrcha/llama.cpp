@@ -225,8 +225,8 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
+    std::vector<ggml_tensor *> get_v_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
@@ -241,9 +241,6 @@ public:
     // the full mask has to be built on the host
     int64_t kq_mask_tail(const llama_ubatch * ubatch, bool causal_attn, int64_t n_kv, int64_t & n_tail) const;
     void    set_input_kq_mask_split(ggml_tensor * row, ggml_tensor * tail, int64_t j0, const llama_ubatch * ubatch) const;
-
-    void set_input_k_rot(ggml_tensor * dst) const;
-    void set_input_v_rot(ggml_tensor * dst) const;
 
     // true if llama_kv_cell_ext holds information that has to survive a state save/restore
     bool has_cell_ext() const;
@@ -270,6 +267,9 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        ggml_tensor * k_rot = nullptr;
+        ggml_tensor * v_rot = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -291,6 +291,11 @@ private:
 
     // pre-computed hadamard martrices
     std::unordered_map<int64_t, std::vector<float>> attn_rot_hadamard;
+
+    // keep constants separate from mutable KV buffers
+    llama_memory_bufs attn_rot_bufs;
+
+    void init_rotation(const char * name_tag);
 
     // env: LLAMA_KV_CACHE_DEBUG
     int debug = 0;
@@ -425,8 +430,8 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
-    ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
-    ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
+    std::vector<ggml_tensor *> get_k_rot() const;
+    std::vector<ggml_tensor *> get_v_rot() const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -438,9 +443,6 @@ public:
     // see llama_kv_cache::kq_mask_tail()
     int64_t kq_mask_tail(const llama_ubatch * ubatch, bool causal_attn, int64_t & n_tail) const;
     void    set_input_kq_mask_split(ggml_tensor * row, ggml_tensor * tail, int64_t j0, const llama_ubatch * ubatch) const;
-
-    void set_input_k_rot(ggml_tensor * dst) const;
-    void set_input_v_rot(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens()
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
